@@ -1,6 +1,134 @@
 # unix-wasm-sandbox
 
 `unix-wasm-sandbox` is a Python package, implemented in Rust with PyO3, for
-running isolated UNIX-like Wasmer environments.
+running isolated UNIX-like Wasmer environments from async Python code.
 
-The project is under active v0.1 development.
+The default sandbox starts with an in-memory filesystem, a working directory at
+`/work`, common coreutils, and CPython 3.12.0. Commands run inside Wasmer WASIX
+and expose captured stdin, stdout, stderr, return codes, working directory, and
+environment overrides through a small Python API.
+
+## Install
+
+From this repository:
+
+```console
+uv venv
+uv pip install -e ".[dev]"
+```
+
+The package contains compressed WEBC assets. On first use, those assets are
+expanded into `XDG_CACHE_HOME/unix-wasm-sandbox` or `~/.cache/unix-wasm-sandbox`.
+
+## Quickstart
+
+```python
+import asyncio
+
+from unix_sandbox import File, Sandbox, SandboxConfig
+
+
+async def main() -> None:
+    sandbox = Sandbox(
+        SandboxConfig(
+            files={
+                "/work/input.txt": File.text("hello from the sandbox\n"),
+            },
+        ),
+    )
+
+    result = await sandbox.run(["cat", "/work/input.txt"], check=True)
+    print(result.stdout_text)
+
+    python = await sandbox.run(
+        ["python", "-c", "import os; print(os.getcwd()); print(6 * 7)"],
+        check=True,
+    )
+    print(python.stdout_text)
+
+
+asyncio.run(main())
+```
+
+## API Shape
+
+`SandboxConfig` controls the initial filesystem, default working directory,
+default environment, and resource limits.
+
+```python
+from unix_sandbox import Directory, File, Limits, SandboxConfig
+
+config = SandboxConfig(
+    files={
+        "/work/src": Directory(),
+        "/work/src/main.py": File.text("print('ok')\n"),
+    },
+    cwd="/work",
+    env={"LANG": "C.UTF-8"},
+    limits=Limits(
+        output_bytes=16 * 1024 * 1024,
+        wall_time_seconds=10.0,
+    ),
+)
+```
+
+`Sandbox.run()` is async and does not block the Python event loop while the
+Wasmer process executes.
+
+```python
+sandbox = Sandbox(config)
+result = await sandbox.run(
+    ["python", "/work/src/main.py"],
+    input=b"",
+    env={"EXTRA": "1"},
+    cwd="/work",
+    check=True,
+)
+```
+
+`CompletedProcess` mirrors the useful parts of `subprocess.CompletedProcess`:
+
+- `args`
+- `returncode`
+- `stdout` and `stderr`
+- `stdout_text` and `stderr_text`
+- `check_returncode()`
+
+Direct filesystem helpers are also async:
+
+```python
+await sandbox.write_text("/work/generated.txt", "data")
+text = await sandbox.read_text("/work/generated.txt")
+names = await sandbox.listdir("/work")
+exists = await sandbox.exists("/work/generated.txt")
+```
+
+## Standard Image
+
+The bundled standard image is pinned and hash-verified:
+
+- `sharrattj/coreutils@1.0.16`
+- `python/python@0.2.0`, CPython 3.12.0
+
+Regenerate the compressed assets with:
+
+```console
+uv run python scripts/fetch_assets.py
+```
+
+## Development
+
+Run the local checks:
+
+```console
+cargo fmt --check
+cargo check
+cargo test
+uv run ruff check .
+uv run mypy
+uv run pytest
+```
+
+## License
+
+Apache-2.0

@@ -6,13 +6,19 @@ on:
 
 jobs:
   test:
-    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.platform.name }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-13, macos-14]
         python-version: ["3.11", "3.12", "3.13"]
+        platform:
+          - name: Linux x64
+            os: ubuntu-22.04
+          - name: macOS x64
+            os: macos-15-intel
+          - name: macOS arm64
+            os: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -31,3 +37,6 @@ jobs:
         run: cargo test
       - name: Test Python
         run: uv run pytest
+      - name: Build Release Wheel
+        if: ${{ matrix.python-version == '3.12' }}
+        run: uv run maturin build --release --out dist
