@@ -1,5 +1,5 @@
 import pytest
-from unix_sandbox import Directory, File, Sandbox, SandboxConfig, SandboxError
+from unix_sandbox import Directory, File, Limits, Sandbox, SandboxConfig, SandboxError
 
 
 @pytest.mark.asyncio
@@ -54,6 +54,22 @@ async def test_python_process_receives_environment_and_cwd() -> None:
         check=True,
     )
     assert result.stdout_text == "/tmp\nvisible\n"
+
+
+@pytest.mark.asyncio
+async def test_wall_time_limit_raises_sandbox_error() -> None:
+    """Verify that long-running commands are stopped by the wall-time limit."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=0.05)))
+    with pytest.raises(SandboxError, match="wall time limit"):
+        await sandbox.run(["python", "-c", "import time; time.sleep(1)"])
+
+
+@pytest.mark.asyncio
+async def test_output_limit_raises_sandbox_error() -> None:
+    """Verify that oversized captured output raises a sandbox error."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(output_bytes=4)))
+    with pytest.raises(SandboxError, match="output exceeded"):
+        await sandbox.run(["python", "-c", "print('too long')"])
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ use std::{
     io::SeekFrom,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -19,6 +20,7 @@ use wasmer_wasix::{
         resolver::InMemorySource,
         task_manager::{tokio::TokioTaskManager, VirtualTaskManagerExt},
     },
+    wasmer_wasix_types::types::Signal,
     PluggableRuntime, Runtime,
 };
 use webc::metadata::annotations::Wasi;
@@ -202,7 +204,6 @@ impl PackageCatalog {
     }
 
     fn run(&self, state: &SandboxState, request: RunRequest) -> Result<CompletedProcess> {
-        let _wall_time_seconds = state.limits.wall_time_seconds;
         if request.args.is_empty() {
             return Err(anyhow!("command arguments cannot be empty"));
         }
@@ -237,8 +238,17 @@ impl PackageCatalog {
         runner.with_stdout(Box::new(stdout.clone()));
         runner.with_stderr(Box::new(stderr.clone()));
 
-        let returncode =
-            self.run_package_command(&mut runner, &target.command, package, state.fs.clone())?;
+        let wall_time = match state.limits.wall_time_seconds {
+            Some(seconds) => Some(duration_from_seconds(seconds)?),
+            None => None,
+        };
+        let returncode = self.run_package_command(
+            &mut runner,
+            &target.command,
+            package,
+            state.fs.clone(),
+            wall_time,
+        )?;
 
         let stdout = self.capture(stdout)?;
         let stderr = self.capture(stderr)?;
@@ -276,6 +286,7 @@ impl PackageCatalog {
         command_name: &str,
         package: &BinaryPackage,
         root_fs: TmpFileSystem,
+        wall_time: Option<Duration>,
     ) -> Result<i32> {
         let command = package
             .get_command(command_name)
@@ -294,18 +305,36 @@ impl PackageCatalog {
         )?;
         let env = builder.build()?;
         let runtime = env.runtime.clone();
+        let process = env.process.clone();
         let tasks = runtime.task_manager().clone();
         let package = package.clone();
         let command_name = command_name.to_string();
 
         let exit_code = tasks.spawn_and_block_on(async move {
-            let mut task_handle = spawn_exec(package, &command_name, env, &runtime)
-                .await
-                .context("spawn failed")?;
-            let exit_code = task_handle
-                .wait_finished()
-                .await
-                .map_err(|error| anyhow!(error.to_string()))?;
+            let run = async move {
+                let mut task_handle = spawn_exec(package, &command_name, env, &runtime)
+                    .await
+                    .context("spawn failed")?;
+                let exit_code = task_handle
+                    .wait_finished()
+                    .await
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                Ok::<_, anyhow::Error>(exit_code)
+            };
+
+            let exit_code = match wall_time {
+                Some(timeout) => match tokio::time::timeout(timeout, run).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        process.signal_process(Signal::Sigkill);
+                        return Err(anyhow!(
+                            "process exceeded wall time limit of {:.3} seconds",
+                            timeout.as_secs_f64()
+                        ));
+                    }
+                },
+                None => run.await?,
+            };
             Ok::<_, anyhow::Error>(exit_code)
         })??;
 
@@ -374,6 +403,15 @@ fn sandbox_engine() -> wasmer::Engine {
     let tunables = BaseTunables::for_target(engine.target());
     engine.set_tunables(tunables);
     engine
+}
+
+fn duration_from_seconds(seconds: f64) -> Result<Duration> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(anyhow!(
+            "wall_time_seconds must be a positive finite number"
+        ));
+    }
+    Ok(Duration::from_secs_f64(seconds))
 }
 
 fn create_default_layout(catalog: &PackageCatalog, fs: &TmpFileSystem) -> Result<()> {

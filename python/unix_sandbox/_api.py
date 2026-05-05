@@ -129,14 +129,17 @@ class Sandbox:
             files[path] = None
 
         asset_dir = _prepare_asset_dir()
-        self._native_sandbox = _native.Sandbox(
-            files,
-            self._config.cwd,
-            self._config.env,
-            str(asset_dir),
-            self._config.limits.output_bytes,
-            self._config.limits.wall_time_seconds,
-        )
+        try:
+            self._native_sandbox = _native.Sandbox(
+                files,
+                self._config.cwd,
+                self._config.env,
+                str(asset_dir),
+                self._config.limits.output_bytes,
+                self._config.limits.wall_time_seconds,
+            )
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
 
     async def __aenter__(self) -> Self:
         """:returns: This sandbox."""
@@ -171,7 +174,10 @@ class Sandbox:
         :raises SandboxError: Raised when check is true and the command fails.
         """
         input_bytes = input.encode() if isinstance(input, str) else input
-        native_result = await self._native_sandbox.run(list(args), input_bytes, env, cwd)
+        try:
+            native_result = await self._native_sandbox.run(list(args), input_bytes, env, cwd)
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
         result = CompletedProcess(
             args=tuple(native_result.args),
             returncode=native_result.returncode,
@@ -186,7 +192,10 @@ class Sandbox:
         """:param path: Absolute sandbox path.
         :returns: File contents.
         """
-        return await self._native_sandbox.read_file(path)
+        try:
+            return await self._native_sandbox.read_file(path)
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
 
     async def read_text(self, path: str, encoding: str = "utf-8") -> str:
         """:param path: Absolute sandbox path.
@@ -200,7 +209,10 @@ class Sandbox:
         """:param path: Absolute sandbox path.
         :param data: File contents.
         """
-        await self._native_sandbox.write_file(path, data)
+        try:
+            await self._native_sandbox.write_file(path, data)
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
 
     async def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:
         """:param path: Absolute sandbox path.
@@ -213,13 +225,19 @@ class Sandbox:
         """:param path: Absolute sandbox path.
         :returns: Whether the path exists.
         """
-        return await self._native_sandbox.exists(path)
+        try:
+            return await self._native_sandbox.exists(path)
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
 
     async def listdir(self, path: str) -> list[str]:
         """:param path: Absolute sandbox path.
         :returns: Directory entry names.
         """
-        return await self._native_sandbox.listdir(path)
+        try:
+            return await self._native_sandbox.listdir(path)
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
 
 
 def _prepare_asset_dir() -> Path:
