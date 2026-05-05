@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-13, macos-14]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Create environment
+        run: uv venv
+      - name: Install package
+        run: uv pip install -e ".[dev]"
+      - name: Check Rust formatting
+        run: cargo fmt --check
+      - name: Lint Python
+        run: uv run ruff check .
+      - name: Type-check Python
+        run: uv run mypy
+      - name: Test Rust
+        run: cargo test
+      - name: Test Python
+        run: uv run pytest

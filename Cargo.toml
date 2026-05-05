@@ -1,0 +1,30 @@
+[package]
+name = "unix-wasm-sandbox"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.84"
+description = "A PyO3-powered Python API for running UNIX-like Wasmer sandboxes."
+
+[lib]
+name = "unix_sandbox_native"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+anyhow = "1.0.95"
+once_cell = "1.20.2"
+pyo3 = "0.28.3"
+pyo3-async-runtimes = { version = "0.28.0", features = ["tokio-runtime"] }
+thiserror = "2.0.11"
+tokio = { version = "1.43.0", features = ["io-util", "rt-multi-thread", "sync", "time"] }
+virtual-fs = "0.601.0"
+wasmer = "6.1.0"
+wasmer-package = "0.601.0"
+wasmer-wasix = "0.601.0"
+webc = "6.0.0"
+
+[dev-dependencies]
+tempfile = "3.15.0"
