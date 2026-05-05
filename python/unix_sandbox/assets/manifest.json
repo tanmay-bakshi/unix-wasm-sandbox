@@ -1,0 +1,12 @@
+{
+  "coreutils": {
+    "package": "sharrattj/coreutils",
+    "version": "1.0.16",
+    "sha256": "59b01ca057218b8ab51cab83546d22b729e015d6cf519b2383cc68bce67ef750"
+  },
+  "python": {
+    "package": "python/python",
+    "version": "0.2.0",
+    "sha256": "47ff83d2d205df14e7f057a1f0a1c1da70c565d2e32c052f2970a150f5a9b407"
+  }
+}

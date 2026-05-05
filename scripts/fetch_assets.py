@@ -1,5 +1,6 @@
 """Fetch pinned Wasmer WEBC assets for the standard sandbox image."""
 
+import gzip
 import hashlib
 import json
 import urllib.request
@@ -14,9 +15,9 @@ ASSETS: dict[str, dict[str, str]] = {
     },
     "python": {
         "package": "python/python",
-        "version": "3.13.5",
-        "sha256": "c03ebe0946e66edf598fd7a1f192101f60e4e9c0095aecd04e049989692bdcab",
-        "url": "https://cdn.wasmer.io/webcimages/c03ebe0946e66edf598fd7a1f192101f60e4e9c0095aecd04e049989692bdcab.webc",
+        "version": "0.2.0",
+        "sha256": "47ff83d2d205df14e7f057a1f0a1c1da70c565d2e32c052f2970a150f5a9b407",
+        "url": "https://cdn.wasmer.io/webcimages/47ff83d2d205df14e7f057a1f0a1c1da70c565d2e32c052f2970a150f5a9b407.webc",
     },
 }
 
@@ -27,20 +28,32 @@ def fetch_asset(name: str, spec: dict[str, str], asset_dir: Path) -> None:
     :param asset_dir: Directory where the asset should be written.
     :raises RuntimeError: Raised when the downloaded asset hash does not match.
     """
-    destination = asset_dir / f"{name}.webc"
+    destination = asset_dir / f"{name}.webc.gz"
     if destination.exists():
-        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        digest = hashlib.sha256(gzip.decompress(destination.read_bytes())).hexdigest()
         if digest == spec["sha256"]:
             return
 
-    with urllib.request.urlopen(spec["url"], timeout=120) as response:
+    raw_destination = asset_dir / f"{name}.webc"
+    if raw_destination.exists():
+        data = raw_destination.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if digest == spec["sha256"]:
+            destination.write_bytes(gzip.compress(data, compresslevel=9, mtime=0))
+            return
+
+    request = urllib.request.Request(
+        spec["url"],
+        headers={"User-Agent": "unix-wasm-sandbox asset fetcher"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
         data = response.read()
 
     digest = hashlib.sha256(data).hexdigest()
     if digest != spec["sha256"]:
         raise RuntimeError(f"{name} hash mismatch: expected {spec['sha256']}, got {digest}")
 
-    destination.write_bytes(data)
+    destination.write_bytes(gzip.compress(data, compresslevel=9, mtime=0))
 
 
 def main() -> None:

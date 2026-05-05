@@ -38,7 +38,7 @@ module-name = "unix_sandbox._native"
 python-source = "python"
 features = ["extension-module"]
 include = [
-    { path = "python/unix_sandbox/assets/*.webc", format = "wheel" },
+    { path = "python/unix_sandbox/assets/*.webc.gz", format = "wheel" },
     { path = "python/unix_sandbox/assets/*.json", format = "wheel" },
 ]
 

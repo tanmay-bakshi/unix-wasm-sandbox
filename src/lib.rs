@@ -1,3 +1,4 @@
+mod core;
 mod py_api;
 
 use pyo3::prelude::*;

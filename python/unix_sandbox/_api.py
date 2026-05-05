@@ -1,11 +1,19 @@
 """Typed Python facade for the Rust sandbox runtime."""
 
+import gzip
+import hashlib
+import json
+import os
 from dataclasses import dataclass, field
 from importlib import resources
+from importlib.resources.abc import Traversable
+from pathlib import Path
 from types import TracebackType
 from typing import Self
 
 from . import _native
+
+ASSET_NAMES: tuple[str, ...] = ("coreutils", "python")
 
 
 class SandboxError(RuntimeError):
@@ -120,7 +128,7 @@ class Sandbox:
                 continue
             files[path] = None
 
-        asset_dir = resources.files("unix_sandbox").joinpath("assets")
+        asset_dir = _prepare_asset_dir()
         self._native_sandbox = _native.Sandbox(
             files,
             self._config.cwd,
@@ -212,3 +220,89 @@ class Sandbox:
         :returns: Directory entry names.
         """
         return await self._native_sandbox.listdir(path)
+
+
+def _prepare_asset_dir() -> Path:
+    """:returns: Directory containing expanded WEBC assets."""
+    source_dir = resources.files("unix_sandbox").joinpath("assets")
+    manifest = _load_asset_manifest(source_dir)
+    cache_dir = _asset_cache_dir(manifest)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    for name in ASSET_NAMES:
+        spec = manifest[name]
+        _expand_asset(source_dir, cache_dir, name, spec["sha256"])
+
+    return cache_dir
+
+
+def _load_asset_manifest(source_dir: Traversable) -> dict[str, dict[str, str]]:
+    """:param source_dir: Package asset directory.
+    :returns: Asset manifest.
+    """
+    data = json.loads(source_dir.joinpath("manifest.json").read_text())
+    return {
+        name: {key: str(value) for key, value in spec.items()}
+        for name, spec in data.items()
+    }
+
+
+def _asset_cache_dir(manifest: dict[str, dict[str, str]]) -> Path:
+    """:param manifest: Asset manifest.
+    :returns: Cache directory for the manifest.
+    """
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    if cache_home is not None and len(cache_home) > 0:
+        root = Path(cache_home)
+    else:
+        root = Path.home() / ".cache"
+
+    manifest_bytes = json.dumps(manifest, sort_keys=True).encode()
+    cache_key = hashlib.sha256(manifest_bytes).hexdigest()[:16]
+    return root / "unix-wasm-sandbox" / "assets" / cache_key
+
+
+def _expand_asset(
+    source_dir: Traversable,
+    cache_dir: Path,
+    name: str,
+    expected_sha256: str,
+) -> None:
+    """:param source_dir: Package asset directory.
+    :param cache_dir: Cache directory for expanded assets.
+    :param name: Asset name.
+    :param expected_sha256: Expected SHA-256 digest of the expanded asset.
+    :raises SandboxError: Raised when the packaged asset hash does not match.
+    """
+    destination = cache_dir / f"{name}.webc"
+    marker = cache_dir / f"{name}.webc.sha256"
+    if (
+        destination.exists()
+        and marker.exists()
+        and marker.read_bytes().strip() == expected_sha256.encode()
+    ):
+        return
+
+    temporary = cache_dir / f"{name}.webc.tmp"
+    digest = hashlib.sha256()
+    with (
+        source_dir.joinpath(f"{name}.webc.gz").open("rb") as compressed,
+        gzip.GzipFile(fileobj=compressed) as expanded,
+        temporary.open("wb") as output,
+    ):
+        while True:
+            chunk = expanded.read(1024 * 1024)
+            if len(chunk) == 0:
+                break
+            digest.update(chunk)
+            output.write(chunk)
+
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != expected_sha256:
+        temporary.unlink(missing_ok=True)
+        raise SandboxError(
+            f"{name} asset hash mismatch: expected {expected_sha256}, got {actual_sha256}"
+        )
+
+    temporary.replace(destination)
+    marker.write_text(expected_sha256 + "\n", encoding="utf-8")

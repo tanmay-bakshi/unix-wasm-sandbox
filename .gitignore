@@ -6,6 +6,8 @@
 .venv/
 dist/
 target/
+python/unix_sandbox/assets/*.webc
+python/unix_sandbox/assets/*.sha256
 *.egg-info/
 __pycache__/
 *.py[cod]

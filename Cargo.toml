@@ -24,7 +24,7 @@ virtual-fs = "0.601.0"
 wasmer = "6.1.0"
 wasmer-package = "0.601.0"
 wasmer-wasix = "0.601.0"
-webc = "6.0.0"
+webc = "10.0.1"
 
 [dev-dependencies]
 tempfile = "3.15.0"
