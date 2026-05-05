@@ -103,6 +103,13 @@ names = await sandbox.listdir("/work")
 exists = await sandbox.exists("/work/generated.txt")
 ```
 
+For the common "raise on failure and return stdout" shape:
+
+```python
+stdout = await sandbox.check_output(["cat", "/work/generated.txt"])
+text = await sandbox.check_output_text(["python", "-c", "print('ok')"])
+```
+
 ## Standard Image
 
 The bundled standard image is pinned and hash-verified:

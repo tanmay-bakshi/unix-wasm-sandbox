@@ -32,6 +32,7 @@ async def test_process_stdin_stdout_and_returncode() -> None:
     sandbox = Sandbox()
     cat = await sandbox.run(["cat"], input="hello", check=True)
     assert cat.stdout_text == "hello"
+    assert await sandbox.check_output_text(["cat"], input="hello") == "hello"
 
     failed = await sandbox.run(["false"])
     assert failed.returncode == 1

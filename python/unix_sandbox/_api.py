@@ -197,6 +197,44 @@ class Sandbox:
         except RuntimeError as error:
             raise SandboxError(str(error)) from error
 
+    async def check_output(
+        self,
+        args: list[str] | tuple[str, ...],
+        *,
+        input: bytes | str | None = None,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+    ) -> bytes:
+        """:param args: Command and arguments.
+        :param input: Bytes or text to pass as stdin.
+        :param env: Environment variable overrides.
+        :param cwd: Working directory override.
+        :returns: Captured stdout bytes.
+        :raises SandboxError: Raised when the command fails.
+        """
+        result = await self.run(args, input=input, env=env, cwd=cwd, check=True)
+        return result.stdout
+
+    async def check_output_text(
+        self,
+        args: list[str] | tuple[str, ...],
+        *,
+        input: bytes | str | None = None,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        encoding: str = "utf-8",
+    ) -> str:
+        """:param args: Command and arguments.
+        :param input: Bytes or text to pass as stdin.
+        :param env: Environment variable overrides.
+        :param cwd: Working directory override.
+        :param encoding: Encoding to use.
+        :returns: Captured stdout text.
+        :raises SandboxError: Raised when the command fails.
+        """
+        data = await self.check_output(args, input=input, env=env, cwd=cwd)
+        return data.decode(encoding)
+
     async def read_text(self, path: str, encoding: str = "utf-8") -> str:
         """:param path: Absolute sandbox path.
         :param encoding: Encoding to use.
