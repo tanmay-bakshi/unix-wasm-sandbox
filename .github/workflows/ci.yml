@@ -34,12 +34,16 @@ jobs:
       - name: Install package
         run: uv pip install -e ".[dev]"
       - name: Check Rust formatting
+        if: ${{ matrix.platform.name == 'Linux x64' && matrix.python-version == '3.12' }}
         run: cargo fmt --check
       - name: Lint Python
+        if: ${{ matrix.platform.name == 'Linux x64' && matrix.python-version == '3.12' }}
         run: uv run ruff check .
       - name: Type-check Python
+        if: ${{ matrix.platform.name == 'Linux x64' && matrix.python-version == '3.12' }}
         run: uv run mypy
       - name: Test Rust
+        if: ${{ matrix.platform.name == 'Linux x64' && matrix.python-version == '3.12' }}
         run: cargo test
       - name: Test Python
         run: uv run pytest
