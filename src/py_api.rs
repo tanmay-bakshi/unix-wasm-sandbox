@@ -5,7 +5,9 @@ use std::{
 
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
-use crate::core::{CompletedProcess as CoreCompletedProcess, Limits, RunRequest, SandboxState};
+use crate::core::{
+    CompletedProcess as CoreCompletedProcess, HostMount, Limits, RunRequest, SandboxState,
+};
 
 #[pyclass(module = "unix_sandbox._native")]
 pub struct CompletedProcess {
@@ -40,6 +42,7 @@ impl Sandbox {
     #[new]
     pub fn new(
         files: HashMap<String, Option<Vec<u8>>>,
+        host_mounts: Vec<(String, String, bool)>,
         cwd: String,
         env: HashMap<String, String>,
         asset_dir: String,
@@ -50,6 +53,14 @@ impl Sandbox {
             state: Arc::new(Mutex::new(
                 SandboxState::new(
                     files,
+                    host_mounts
+                        .into_iter()
+                        .map(|(source, target, read_only)| HostMount {
+                            source,
+                            target,
+                            read_only,
+                        })
+                        .collect(),
                     cwd,
                     env,
                     asset_dir,

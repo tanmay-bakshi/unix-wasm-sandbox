@@ -11,6 +11,7 @@ class Sandbox:
     def __init__(
         self,
         files: dict[str, bytes | None],
+        host_mounts: list[tuple[str, str, bool]],
         cwd: str,
         env: dict[str, str],
         asset_dir: str,

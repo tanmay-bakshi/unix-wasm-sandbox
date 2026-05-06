@@ -57,13 +57,16 @@ asyncio.run(main())
 default environment, and resource limits.
 
 ```python
-from unix_sandbox import Directory, File, Limits, SandboxConfig
+from unix_sandbox import Directory, File, HostMount, Limits, SandboxConfig
 
 config = SandboxConfig(
     files={
         "/work/src": Directory(),
         "/work/src/main.py": File.text("print('ok')\n"),
     },
+    host_mounts=[
+        HostMount("./project-data", "/mnt/project-data"),
+    ],
     cwd="/work",
     env={"LANG": "C.UTF-8"},
     limits=Limits(
@@ -89,6 +92,10 @@ result = await sandbox.run(
 
 Captured stdout and stderr are capped while the process writes, so a process
 cannot fill host memory before `Limits.output_bytes` is enforced.
+
+Host mounts are live views of host directories and are read-only by default.
+Use `HostMount(source, target, read_only=False)` only when sandbox writes should
+persist back to the host directory.
 
 `CompletedProcess` mirrors the useful parts of `subprocess.CompletedProcess`:
 

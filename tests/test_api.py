@@ -1,5 +1,7 @@
+from pathlib import Path
+
 import pytest
-from unix_sandbox import Directory, File, Limits, Sandbox, SandboxConfig, SandboxError
+from unix_sandbox import Directory, File, HostMount, Limits, Sandbox, SandboxConfig, SandboxError
 
 
 @pytest.mark.asyncio
@@ -198,6 +200,62 @@ async def test_filesystem_api_round_trip() -> None:
 
     result = await sandbox.run(["cat", "/work/generated/output.txt"], check=True)
     assert result.stdout_text == "written"
+
+
+@pytest.mark.asyncio
+async def test_read_only_host_mount_exposes_live_host_files(tmp_path: Path) -> None:
+    """Verify that read-only host mounts expose current host file contents."""
+    host_file = tmp_path / "input.txt"
+    host_file.write_text("alpha", encoding="utf-8")
+    sandbox = Sandbox(SandboxConfig(host_mounts=[HostMount(tmp_path, "/host")]))
+
+    assert await sandbox.read_text("/host/input.txt") == "alpha"
+
+    host_file.write_text("beta", encoding="utf-8")
+    result = await sandbox.run(["cat", "/host/input.txt"], check=True)
+    assert result.stdout_text == "beta"
+
+    with pytest.raises(SandboxError, match="permission denied"):
+        await sandbox.write_text("/host/input.txt", "blocked")
+
+    failed = await sandbox.run(["bash", "-lc", "printf blocked > /host/input.txt"])
+    assert failed.returncode != 0
+    assert host_file.read_text(encoding="utf-8") == "beta"
+
+
+@pytest.mark.asyncio
+async def test_writable_host_mount_persists_host_changes(tmp_path: Path) -> None:
+    """Verify that writable host mounts persist direct and process writes."""
+    sandbox = Sandbox(
+        SandboxConfig(host_mounts=[HostMount(tmp_path, "/host", read_only=False)]),
+    )
+
+    await sandbox.write_text("/host/generated.txt", "created")
+    assert (tmp_path / "generated.txt").read_text(encoding="utf-8") == "created"
+
+    result = await sandbox.run(
+        ["bash", "-lc", "printf updated > /host/generated.txt"],
+        check=True,
+    )
+    assert result.stderr == b""
+    assert (tmp_path / "generated.txt").read_text(encoding="utf-8") == "updated"
+
+
+def test_host_mount_rejects_relative_targets(tmp_path: Path) -> None:
+    """Verify that host mount targets must be absolute sandbox paths."""
+    with pytest.raises(ValueError, match="absolute"):
+        HostMount(tmp_path, "relative")
+
+
+def test_host_mount_source_must_be_directory(tmp_path: Path) -> None:
+    """Verify that sandbox construction validates host mount sources."""
+    with pytest.raises(SandboxError, match="host mount source does not exist"):
+        Sandbox(SandboxConfig(host_mounts=[HostMount(tmp_path / "missing", "/host")]))
+
+    host_file = tmp_path / "file.txt"
+    host_file.write_text("x", encoding="utf-8")
+    with pytest.raises(SandboxError, match="host mount source is not a directory"):
+        Sandbox(SandboxConfig(host_mounts=[HostMount(host_file, "/host")]))
 
 
 def test_file_text_constructor() -> None:

@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     io::{self, SeekFrom},
     path::{Path, PathBuf},
     pin::Pin,
@@ -12,7 +13,8 @@ use anyhow::{anyhow, Context, Result};
 use once_cell::sync::Lazy;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncWrite, AsyncWriteExt, ReadBuf};
 use virtual_fs::{
-    create_dir_all, FileSystem, FsError, NullFile, StaticFile, TmpFileSystem, VirtualFile,
+    create_dir_all, host_fs, FileOpener, FileSystem, FsError, NullFile, OpenOptionsConfig,
+    StaticFile, TmpFileSystem, VirtualFile,
 };
 use wasmer::sys::{BaseTunables, Cranelift, EngineBuilder, Features, NativeEngineExt};
 use wasmer_package::utils::from_bytes;
@@ -52,6 +54,13 @@ pub struct Limits {
 }
 
 #[derive(Clone)]
+pub struct HostMount {
+    pub source: String,
+    pub target: String,
+    pub read_only: bool,
+}
+
+#[derive(Clone)]
 pub struct CompletedProcess {
     pub args: Vec<String>,
     pub returncode: i32,
@@ -88,9 +97,193 @@ pub struct RunRequest {
     pub cwd: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct ReadOnlyFileSystem {
+    inner: Arc<dyn FileSystem + Send + Sync>,
+}
+
+#[derive(Debug)]
+struct ReadOnlyVirtualFile {
+    inner: Box<dyn VirtualFile + Send + Sync + 'static>,
+}
+
+impl ReadOnlyFileSystem {
+    fn new(inner: Arc<dyn FileSystem + Send + Sync>) -> Self {
+        Self { inner }
+    }
+}
+
+impl FileSystem for ReadOnlyFileSystem {
+    fn readlink(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
+        self.inner.readlink(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
+        self.inner.read_dir(path)
+    }
+
+    fn create_dir(&self, _path: &Path) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn remove_dir(&self, _path: &Path) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn rename<'a>(
+        &'a self,
+        _from: &'a Path,
+        _to: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = virtual_fs::Result<()>> + Send + 'a>> {
+        Box::pin(async { Err(FsError::PermissionDenied) })
+    }
+
+    fn metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
+        self.inner.metadata(path)
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
+        self.inner.symlink_metadata(path)
+    }
+
+    fn remove_file(&self, _path: &Path) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
+        virtual_fs::OpenOptions::new(self)
+    }
+
+    fn mount(
+        &self,
+        _name: String,
+        _path: &Path,
+        _fs: Box<dyn FileSystem + Send + Sync>,
+    ) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+}
+
+impl FileOpener for ReadOnlyFileSystem {
+    fn open(
+        &self,
+        path: &Path,
+        config: &OpenOptionsConfig,
+    ) -> virtual_fs::Result<Box<dyn VirtualFile + Send + Sync + 'static>> {
+        if config.create() || config.create_new() || config.append() || config.truncate() {
+            return Err(FsError::PermissionDenied);
+        }
+
+        let mut read_config = config.clone();
+        read_config.read = true;
+        read_config.write = false;
+
+        let mut options = self.inner.new_open_options();
+        let file = options.options(read_config).open(path)?;
+        Ok(Box::new(ReadOnlyVirtualFile { inner: file }))
+    }
+}
+
+impl AsyncRead for ReadOnlyVirtualFile {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncSeek for ReadOnlyVirtualFile {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        Pin::new(&mut *self.inner).start_seek(position)
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<u64>> {
+        Pin::new(&mut *self.inner).poll_complete(cx)
+    }
+}
+
+impl AsyncWrite for ReadOnlyVirtualFile {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(read_only_mount_error()))
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        _bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(read_only_mount_error()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl VirtualFile for ReadOnlyVirtualFile {
+    fn last_accessed(&self) -> u64 {
+        self.inner.last_accessed()
+    }
+
+    fn last_modified(&self) -> u64 {
+        self.inner.last_modified()
+    }
+
+    fn created_time(&self) -> u64 {
+        self.inner.created_time()
+    }
+
+    fn set_times(&mut self, _atime: Option<u64>, _mtime: Option<u64>) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    fn set_len(&mut self, _new_size: u64) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn unlink(&mut self) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn is_open(&self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn get_special_fd(&self) -> Option<u32> {
+        self.inner.get_special_fd()
+    }
+
+    fn poll_read_ready(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<usize>> {
+        let inner = self.get_mut();
+        Pin::new(&mut *inner.inner).poll_read_ready(cx)
+    }
+
+    fn poll_write_ready(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(0))
+    }
+}
+
 impl SandboxState {
     pub fn new(
         files: HashMap<String, Option<Vec<u8>>>,
+        host_mounts: Vec<HostMount>,
         cwd: String,
         env: HashMap<String, String>,
         asset_dir: String,
@@ -120,6 +313,10 @@ impl SandboxState {
                 Some(data) => state.write_file_blocking(&path, data)?,
                 None => state.create_directory(&path)?,
             }
+        }
+
+        for mount in host_mounts {
+            state.mount_host(mount)?;
         }
 
         Ok(state)
@@ -153,6 +350,37 @@ impl SandboxState {
         let path = normalize_path(path)?;
         create_dir_all(&self.fs, &path)
             .with_context(|| format!("unable to create {}", path.display()))
+    }
+
+    pub fn mount_host(&self, mount: HostMount) -> Result<()> {
+        let target = normalize_path(&mount.target)?;
+        if target == Path::new("/") {
+            return Err(anyhow!("host mount target cannot be the sandbox root"));
+        }
+
+        create_parent_directories(&self.fs, &target)?;
+        if let Ok(metadata) = self.fs.metadata(&target) {
+            if !metadata.is_dir() {
+                return Err(anyhow!(
+                    "host mount target is not a directory: {}",
+                    target.display()
+                ));
+            }
+        }
+
+        let source = validate_host_mount_source(&mount.source)?;
+        let host_fs = host_fs::FileSystem::new(self.catalog.handle.clone(), source.clone())
+            .with_context(|| format!("unable to mount host source {}", source.display()))?;
+        let host_fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(host_fs);
+        let mounted_fs: Arc<dyn FileSystem + Send + Sync> = if mount.read_only {
+            Arc::new(ReadOnlyFileSystem::new(host_fs))
+        } else {
+            host_fs
+        };
+
+        self.fs
+            .mount(target.clone(), &mounted_fs, PathBuf::from("/"))
+            .with_context(|| format!("unable to mount host source at {}", target.display()))
     }
 
     pub fn listdir(&self, path: &str) -> Result<Vec<String>> {
@@ -627,6 +855,10 @@ fn output_limit_error(limit: usize) -> io::Error {
     io::Error::other(format!("process output exceeded {limit} bytes"))
 }
 
+fn read_only_mount_error() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "read-only host mount")
+}
+
 fn normalize_process_outcome(command: &str, returncode: i32, stderr: Vec<u8>) -> (i32, Vec<u8>) {
     const FIND_CWD_RESTORE_ERROR: &[u8] =
         b"(null): Failed to restore initial working directory: Not a directory\n";
@@ -795,6 +1027,37 @@ fn validate_directory(fs: &TmpFileSystem, path: &Path, name: &str) -> Result<()>
         return Ok(());
     }
     Err(anyhow!("{name} is not a directory: {}", path.display()))
+}
+
+fn validate_host_mount_source(path: &str) -> Result<PathBuf> {
+    if path.as_bytes().contains(&0) {
+        return Err(anyhow!("host mount source cannot contain NUL bytes"));
+    }
+
+    let path = PathBuf::from(path);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "host mount source does not exist: {}",
+                path.display()
+            ));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("unable to inspect host mount source {}", path.display())
+            });
+        }
+    };
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "host mount source is not a directory: {}",
+            path.display()
+        ));
+    }
+
+    path.canonicalize()
+        .with_context(|| format!("unable to resolve host mount source {}", path.display()))
 }
 
 fn create_parent_directories(fs: &TmpFileSystem, path: &Path) -> Result<()> {

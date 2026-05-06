@@ -53,6 +53,33 @@ class Directory:
 
 
 @dataclass(frozen=True, slots=True)
+class HostMount:
+    """A live host directory mount inside the sandbox filesystem.
+
+    :ivar source: Host directory to expose.
+    :ivar target: Absolute sandbox directory path.
+    :ivar read_only: Whether sandbox processes can only read from the mount.
+    """
+
+    source: str | Path
+    target: str
+    read_only: bool = True
+
+    def __post_init__(self) -> None:
+        """:raises ValueError: Raised when a mount path is invalid."""
+        if "\0" in str(self.source):
+            raise ValueError("host mount source cannot contain NUL bytes")
+        if "\0" in self.target:
+            raise ValueError("host mount target cannot contain NUL bytes")
+        if not self.target.startswith("/"):
+            raise ValueError("host mount target must be absolute")
+
+    def _native_tuple(self) -> tuple[str, str, bool]:
+        """:returns: Native mount configuration tuple."""
+        return (str(Path(self.source).expanduser()), self.target, self.read_only)
+
+
+@dataclass(frozen=True, slots=True)
 class Limits:
     """Resource limits applied to sandbox process execution.
 
@@ -79,12 +106,14 @@ class SandboxConfig:
     """Configuration for a sandbox instance.
 
     :ivar files: Filesystem entries to create before commands run.
+    :ivar host_mounts: Live host directory mounts to expose inside the sandbox.
     :ivar cwd: Default working directory.
     :ivar env: Default environment variables.
     :ivar limits: Default resource limits.
     """
 
     files: dict[str, File | Directory] = field(default_factory=dict)
+    host_mounts: list[HostMount] = field(default_factory=list)
     cwd: str = "/work"
     env: dict[str, str] = field(default_factory=dict)
     limits: Limits = field(default_factory=Limits)
@@ -144,6 +173,7 @@ class Sandbox:
         try:
             self._native_sandbox = _native.Sandbox(
                 files,
+                [mount._native_tuple() for mount in self._config.host_mounts],
                 self._config.cwd,
                 self._config.env,
                 str(asset_dir),
