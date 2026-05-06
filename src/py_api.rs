@@ -6,7 +6,8 @@ use std::{
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
 use crate::core::{
-    CompletedProcess as CoreCompletedProcess, HostMount, Limits, RunRequest, SandboxState,
+    CompletedProcess as CoreCompletedProcess, EventBus, FileSystemEvent, HostMount, Limits,
+    RunRequest, SandboxState,
 };
 
 #[pyclass(module = "unix_sandbox._native")]
@@ -35,6 +36,8 @@ impl From<CoreCompletedProcess> for CompletedProcess {
 #[pyclass(module = "unix_sandbox._native")]
 pub struct Sandbox {
     state: Arc<Mutex<SandboxState>>,
+    events: EventBus,
+    event_receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<FileSystemEvent>>>,
 }
 
 #[pymethods]
@@ -48,7 +51,9 @@ impl Sandbox {
         asset_dir: String,
         output_limit: usize,
         wall_time_seconds: Option<f64>,
+        event_queue_size: usize,
     ) -> PyResult<Self> {
+        let (events, event_receiver) = EventBus::new(event_queue_size);
         Ok(Self {
             state: Arc::new(Mutex::new(
                 SandboxState::new(
@@ -68,9 +73,50 @@ impl Sandbox {
                         output_bytes: output_limit,
                         wall_time_seconds,
                     },
+                    events.clone(),
                 )
                 .map_err(py_error)?,
             )),
+            events,
+            event_receiver: Arc::new(tokio::sync::Mutex::new(event_receiver)),
+        })
+    }
+
+    fn set_event_notifications_enabled(&self, enabled: bool) {
+        self.events.set_enabled(enabled);
+    }
+
+    fn clear_events_now(&self) {
+        let Ok(mut event_receiver) = self.event_receiver.try_lock() else {
+            return;
+        };
+        while event_receiver.try_recv().is_ok() {}
+    }
+
+    fn clear_events<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let event_receiver = self.event_receiver.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut event_receiver = event_receiver.lock().await;
+            while event_receiver.try_recv().is_ok() {}
+            Ok(())
+        })
+    }
+
+    fn next_event<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let event_receiver = self.event_receiver.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut event_receiver = event_receiver.lock().await;
+            let event = event_receiver
+                .recv()
+                .await
+                .ok_or_else(|| PyRuntimeError::new_err("sandbox event stream closed"))?;
+            Ok((
+                event.sequence,
+                event.kind.as_str().to_string(),
+                event.path,
+                event.target_path,
+                event.dropped_count,
+            ))
         })
     }
 

@@ -4,7 +4,10 @@ use std::{
     io::{self, SeekFrom},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -14,20 +17,19 @@ use once_cell::sync::Lazy;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncWrite, AsyncWriteExt, ReadBuf};
 use virtual_fs::{
     create_dir_all, host_fs, FileOpener, FileSystem, FsError, NullFile, OpenOptionsConfig,
-    StaticFile, TmpFileSystem, VirtualFile,
+    OverlayFileSystem, StaticFile, TmpFileSystem, UnionFileSystem, UnionMergeMode, VirtualFile,
 };
 use wasmer::sys::{BaseTunables, Cranelift, EngineBuilder, Features, NativeEngineExt};
 use wasmer_package::utils::from_bytes;
 use wasmer_wasix::{
     bin_factory::{spawn_exec, BinaryPackage},
-    runners::wasi::{PackageOrHash, RuntimeOrEngine, WasiRunner},
     runtime::{
         package_loader::BuiltinPackageLoader,
         resolver::InMemorySource,
         task_manager::{tokio::TokioTaskManager, VirtualTaskManagerExt},
     },
     wasmer_wasix_types::types::Signal,
-    PluggableRuntime, Runtime,
+    PluggableRuntime, Runtime, WasiEnvBuilder,
 };
 use webc::metadata::annotations::Wasi;
 
@@ -75,6 +77,7 @@ pub struct SandboxState {
     pub env: HashMap<String, String>,
     pub limits: Limits,
     pub catalog: Arc<PackageCatalog>,
+    pub events: EventBus,
 }
 
 #[derive(Clone)]
@@ -97,6 +100,49 @@ pub struct RunRequest {
     pub cwd: Option<String>,
 }
 
+struct ProcessIo {
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    cwd: PathBuf,
+    stdin: Box<dyn VirtualFile + Send + Sync + 'static>,
+    stdout: Box<dyn VirtualFile + Send + Sync + 'static>,
+    stderr: Box<dyn VirtualFile + Send + Sync + 'static>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FileSystemEvent {
+    pub sequence: u64,
+    pub kind: FileSystemEventKind,
+    pub path: String,
+    pub target_path: Option<String>,
+    pub dropped_count: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum FileSystemEventKind {
+    FileCreated,
+    FileModified,
+    FileMetadataModified,
+    FileRemoved,
+    DirectoryCreated,
+    DirectoryRemoved,
+    PathRenamed,
+    EventsDropped,
+}
+
+#[derive(Clone, Debug)]
+pub struct EventBus {
+    inner: Arc<EventBusInner>,
+}
+
+#[derive(Debug)]
+struct EventBusInner {
+    sender: tokio::sync::mpsc::Sender<FileSystemEvent>,
+    enabled: AtomicBool,
+    sequence: AtomicU64,
+    dropped_count: AtomicU64,
+}
+
 #[derive(Clone, Debug)]
 struct ReadOnlyFileSystem {
     inner: Arc<dyn FileSystem + Send + Sync>,
@@ -107,9 +153,116 @@ struct ReadOnlyVirtualFile {
     inner: Box<dyn VirtualFile + Send + Sync + 'static>,
 }
 
+#[derive(Clone, Debug)]
+struct ObservableFileSystem {
+    inner: Arc<dyn FileSystem + Send + Sync>,
+    events: EventBus,
+}
+
+#[derive(Debug)]
+struct ObservableVirtualFile {
+    inner: Box<dyn VirtualFile + Send + Sync + 'static>,
+    events: EventBus,
+    path: String,
+}
+
+#[derive(Debug)]
+struct RelativeOrAbsolutePathHack<F>(F);
+
+impl FileSystemEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FileCreated => "file_created",
+            Self::FileModified => "file_modified",
+            Self::FileMetadataModified => "file_metadata_modified",
+            Self::FileRemoved => "file_removed",
+            Self::DirectoryCreated => "directory_created",
+            Self::DirectoryRemoved => "directory_removed",
+            Self::PathRenamed => "path_renamed",
+            Self::EventsDropped => "events_dropped",
+        }
+    }
+}
+
+impl EventBus {
+    pub fn new(capacity: usize) -> (Self, tokio::sync::mpsc::Receiver<FileSystemEvent>) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+        (
+            Self {
+                inner: Arc::new(EventBusInner {
+                    sender,
+                    enabled: AtomicBool::new(false),
+                    sequence: AtomicU64::new(0),
+                    dropped_count: AtomicU64::new(0),
+                }),
+            },
+            receiver,
+        )
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.inner.enabled.store(enabled, Ordering::Release);
+        if enabled {
+            return;
+        }
+        self.inner.dropped_count.store(0, Ordering::Release);
+    }
+
+    fn emit(&self, kind: FileSystemEventKind, path: String, target_path: Option<String>) {
+        if !self.inner.enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        let dropped_count = self.inner.dropped_count.swap(0, Ordering::AcqRel);
+        if dropped_count > 0 {
+            let dropped_event = self.event(
+                FileSystemEventKind::EventsDropped,
+                "/".to_string(),
+                None,
+                dropped_count,
+            );
+            if self.inner.sender.try_send(dropped_event).is_err() {
+                self.inner
+                    .dropped_count
+                    .fetch_add(dropped_count.saturating_add(1), Ordering::AcqRel);
+                return;
+            }
+        }
+
+        let event = self.event(kind, path, target_path, 0);
+        if self.inner.sender.try_send(event).is_ok() {
+            return;
+        }
+
+        self.inner.dropped_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn event(
+        &self,
+        kind: FileSystemEventKind,
+        path: String,
+        target_path: Option<String>,
+        dropped_count: u64,
+    ) -> FileSystemEvent {
+        FileSystemEvent {
+            sequence: self.inner.sequence.fetch_add(1, Ordering::AcqRel) + 1,
+            kind,
+            path,
+            target_path,
+            dropped_count,
+        }
+    }
+}
+
 impl ReadOnlyFileSystem {
     fn new(inner: Arc<dyn FileSystem + Send + Sync>) -> Self {
         Self { inner }
+    }
+}
+
+impl ObservableFileSystem {
+    fn new(inner: Arc<dyn FileSystem + Send + Sync>, events: EventBus) -> Self {
+        Self { inner, events }
     }
 }
 
@@ -280,6 +433,333 @@ impl VirtualFile for ReadOnlyVirtualFile {
     }
 }
 
+impl FileSystem for ObservableFileSystem {
+    fn readlink(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
+        self.inner.readlink(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
+        self.inner.read_dir(path)
+    }
+
+    fn create_dir(&self, path: &Path) -> virtual_fs::Result<()> {
+        let result = self.inner.create_dir(path);
+        if result.is_ok() {
+            self.events.emit(
+                FileSystemEventKind::DirectoryCreated,
+                event_path(path),
+                None,
+            );
+        }
+        result
+    }
+
+    fn remove_dir(&self, path: &Path) -> virtual_fs::Result<()> {
+        let result = self.inner.remove_dir(path);
+        if result.is_ok() {
+            self.events.emit(
+                FileSystemEventKind::DirectoryRemoved,
+                event_path(path),
+                None,
+            );
+        }
+        result
+    }
+
+    fn rename<'a>(
+        &'a self,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = virtual_fs::Result<()>> + Send + 'a>> {
+        let inner = Arc::clone(&self.inner);
+        let events = self.events.clone();
+        let from_path = from.to_path_buf();
+        let to_path = to.to_path_buf();
+        Box::pin(async move {
+            inner.rename(&from_path, &to_path).await?;
+            events.emit(
+                FileSystemEventKind::PathRenamed,
+                event_path(&from_path),
+                Some(event_path(&to_path)),
+            );
+            Ok(())
+        })
+    }
+
+    fn metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
+        self.inner.metadata(path)
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
+        self.inner.symlink_metadata(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> virtual_fs::Result<()> {
+        let result = self.inner.remove_file(path);
+        if result.is_ok() {
+            self.events
+                .emit(FileSystemEventKind::FileRemoved, event_path(path), None);
+        }
+        result
+    }
+
+    fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
+        virtual_fs::OpenOptions::new(self)
+    }
+
+    fn mount(
+        &self,
+        name: String,
+        path: &Path,
+        fs: Box<dyn FileSystem + Send + Sync>,
+    ) -> virtual_fs::Result<()> {
+        self.inner.mount(name, path, fs)
+    }
+}
+
+impl FileOpener for ObservableFileSystem {
+    fn open(
+        &self,
+        path: &Path,
+        config: &OpenOptionsConfig,
+    ) -> virtual_fs::Result<Box<dyn VirtualFile + Send + Sync + 'static>> {
+        let existed = self.inner.metadata(path).is_ok();
+        let mut options = self.inner.new_open_options();
+        let file = options.options(config.clone()).open(path)?;
+        let path = event_path(path);
+
+        if !existed && (config.create() || config.create_new()) {
+            self.events
+                .emit(FileSystemEventKind::FileCreated, path.clone(), None);
+        } else if config.truncate() {
+            self.events
+                .emit(FileSystemEventKind::FileModified, path.clone(), None);
+        }
+
+        if config.would_mutate() {
+            return Ok(Box::new(ObservableVirtualFile {
+                inner: file,
+                events: self.events.clone(),
+                path,
+            }));
+        }
+
+        Ok(file)
+    }
+}
+
+impl AsyncRead for ObservableVirtualFile {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncSeek for ObservableVirtualFile {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        Pin::new(&mut *self.inner).start_seek(position)
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<u64>> {
+        Pin::new(&mut *self.inner).poll_complete(cx)
+    }
+}
+
+impl AsyncWrite for ObservableVirtualFile {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut *self.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(bytes_written)) => {
+                if bytes_written > 0 {
+                    self.events
+                        .emit(FileSystemEventKind::FileModified, self.path.clone(), None);
+                }
+                Poll::Ready(Ok(bytes_written))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut *self.inner).poll_write_vectored(cx, bufs) {
+            Poll::Ready(Ok(bytes_written)) => {
+                if bytes_written > 0 {
+                    self.events
+                        .emit(FileSystemEventKind::FileModified, self.path.clone(), None);
+                }
+                Poll::Ready(Ok(bytes_written))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+impl VirtualFile for ObservableVirtualFile {
+    fn last_accessed(&self) -> u64 {
+        self.inner.last_accessed()
+    }
+
+    fn last_modified(&self) -> u64 {
+        self.inner.last_modified()
+    }
+
+    fn created_time(&self) -> u64 {
+        self.inner.created_time()
+    }
+
+    fn set_times(&mut self, atime: Option<u64>, mtime: Option<u64>) -> virtual_fs::Result<()> {
+        self.inner.set_times(atime, mtime)?;
+        self.events.emit(
+            FileSystemEventKind::FileMetadataModified,
+            self.path.clone(),
+            None,
+        );
+        Ok(())
+    }
+
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    fn set_len(&mut self, new_size: u64) -> virtual_fs::Result<()> {
+        self.inner.set_len(new_size)?;
+        self.events
+            .emit(FileSystemEventKind::FileModified, self.path.clone(), None);
+        Ok(())
+    }
+
+    fn unlink(&mut self) -> virtual_fs::Result<()> {
+        self.inner.unlink()?;
+        self.events
+            .emit(FileSystemEventKind::FileRemoved, self.path.clone(), None);
+        Ok(())
+    }
+
+    fn is_open(&self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn get_special_fd(&self) -> Option<u32> {
+        self.inner.get_special_fd()
+    }
+
+    fn write_from_mmap(&mut self, offset: u64, len: u64) -> io::Result<()> {
+        self.inner.write_from_mmap(offset, len)?;
+        self.events
+            .emit(FileSystemEventKind::FileModified, self.path.clone(), None);
+        Ok(())
+    }
+
+    fn poll_read_ready(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<usize>> {
+        let inner = self.get_mut();
+        Pin::new(&mut *inner.inner).poll_read_ready(cx)
+    }
+
+    fn poll_write_ready(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<usize>> {
+        let inner = self.get_mut();
+        Pin::new(&mut *inner.inner).poll_write_ready(cx)
+    }
+}
+
+impl<F: FileSystem> RelativeOrAbsolutePathHack<F> {
+    fn execute<Func, Ret>(&self, path: &Path, operation: Func) -> virtual_fs::Result<Ret>
+    where
+        Func: Fn(&F, &Path) -> virtual_fs::Result<Ret>,
+    {
+        let result = operation(&self.0, path);
+        if result.is_err() && !path.is_absolute() {
+            return operation(&self.0, &Path::new("/").join(path));
+        }
+        result
+    }
+}
+
+impl<F: FileSystem> FileSystem for RelativeOrAbsolutePathHack<F> {
+    fn readlink(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
+        self.execute(path, |fs, candidate| fs.readlink(candidate))
+    }
+
+    fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
+        self.execute(path, |fs, candidate| fs.read_dir(candidate))
+    }
+
+    fn create_dir(&self, path: &Path) -> virtual_fs::Result<()> {
+        self.execute(path, |fs, candidate| fs.create_dir(candidate))
+    }
+
+    fn remove_dir(&self, path: &Path) -> virtual_fs::Result<()> {
+        self.execute(path, |fs, candidate| fs.remove_dir(candidate))
+    }
+
+    fn rename<'a>(
+        &'a self,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = virtual_fs::Result<()>> + Send + 'a>> {
+        Box::pin(async move { self.0.rename(from, to).await })
+    }
+
+    fn metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
+        self.execute(path, |fs, candidate| fs.metadata(candidate))
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
+        self.execute(path, |fs, candidate| fs.symlink_metadata(candidate))
+    }
+
+    fn remove_file(&self, path: &Path) -> virtual_fs::Result<()> {
+        self.execute(path, |fs, candidate| fs.remove_file(candidate))
+    }
+
+    fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
+        virtual_fs::OpenOptions::new(self)
+    }
+
+    fn mount(
+        &self,
+        name: String,
+        path: &Path,
+        fs: Box<dyn FileSystem + Send + Sync>,
+    ) -> virtual_fs::Result<()> {
+        let fs = Arc::new(fs);
+        self.execute(path, move |inner, candidate| {
+            inner.mount(name.clone(), candidate, Box::new(Arc::clone(&fs)))
+        })
+    }
+}
+
+impl<F: FileSystem> FileOpener for RelativeOrAbsolutePathHack<F> {
+    fn open(
+        &self,
+        path: &Path,
+        config: &OpenOptionsConfig,
+    ) -> virtual_fs::Result<Box<dyn VirtualFile + Send + Sync + 'static>> {
+        self.execute(path, |fs, candidate| {
+            fs.new_open_options()
+                .options(config.clone())
+                .open(candidate)
+        })
+    }
+}
+
 impl SandboxState {
     pub fn new(
         files: HashMap<String, Option<Vec<u8>>>,
@@ -288,6 +768,7 @@ impl SandboxState {
         env: HashMap<String, String>,
         asset_dir: String,
         limits: Limits,
+        events: EventBus,
     ) -> Result<Self> {
         let catalog = catalog_for(asset_dir)?;
         let fs = TmpFileSystem::new();
@@ -306,12 +787,13 @@ impl SandboxState {
             env: sandbox_env,
             limits,
             catalog,
+            events,
         };
 
         for (path, contents) in files {
             match contents {
-                Some(data) => state.write_file_blocking(&path, data)?,
-                None => state.create_directory(&path)?,
+                Some(data) => state.write_file_silent_blocking(&path, data)?,
+                None => state.create_directory_silent(&path)?,
             }
         }
 
@@ -336,20 +818,49 @@ impl SandboxState {
 
     pub async fn write_file(&self, path: &str, data: Vec<u8>) -> Result<()> {
         let path = normalize_path(path)?;
+        let existed = self.fs.metadata(&path).is_ok();
+        self.create_parent_directories(&path)?;
+        write_file_to_fs(&self.fs, &path, data)
+            .await
+            .with_context(|| format!("unable to write {}", path.display()))?;
+        let kind = if existed {
+            FileSystemEventKind::FileModified
+        } else {
+            FileSystemEventKind::FileCreated
+        };
+        self.events.emit(kind, event_path(&path), None);
+        Ok(())
+    }
+
+    fn write_file_silent_blocking(&self, path: &str, data: Vec<u8>) -> Result<()> {
+        self.catalog.block_on(self.write_file_silent(path, data))
+    }
+
+    async fn write_file_silent(&self, path: &str, data: Vec<u8>) -> Result<()> {
+        let path = normalize_path(path)?;
         create_parent_directories(&self.fs, &path)?;
         write_file_to_fs(&self.fs, &path, data)
             .await
             .with_context(|| format!("unable to write {}", path.display()))
     }
 
-    pub fn write_file_blocking(&self, path: &str, data: Vec<u8>) -> Result<()> {
-        self.catalog.block_on(self.write_file(path, data))
-    }
-
-    pub fn create_directory(&self, path: &str) -> Result<()> {
+    fn create_directory_silent(&self, path: &str) -> Result<()> {
         let path = normalize_path(path)?;
         create_dir_all(&self.fs, &path)
             .with_context(|| format!("unable to create {}", path.display()))
+    }
+
+    fn create_parent_directories(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            for created_path in create_directories(&self.fs, parent)? {
+                self.events.emit(
+                    FileSystemEventKind::DirectoryCreated,
+                    event_path(&created_path),
+                    None,
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn mount_host(&self, mount: HostMount) -> Result<()> {
@@ -475,24 +986,26 @@ impl PackageCatalog {
         let stderr = CapturedOutput::new(state.limits.output_bytes);
         let stdin = StaticFile::new(request.input.unwrap_or_default());
 
-        let mut runner = WasiRunner::new();
-        runner.with_args(request.args.iter().skip(1).cloned());
-        runner.with_envs(env);
-        runner.with_current_dir(cwd);
-        runner.with_stdin(Box::new(stdin));
-        runner.with_stdout(Box::new(stdout.file()));
-        runner.with_stderr(Box::new(stderr.file()));
-        runner.with_injected_packages(self.injected_packages(&target.package));
+        let injected_packages = self.injected_packages(&target.package);
 
         let wall_time = match state.limits.wall_time_seconds {
             Some(seconds) => Some(duration_from_seconds(seconds)?),
             None => None,
         };
         let run_result = self.run_package_command(
-            &mut runner,
+            ProcessIo {
+                args: request.args.iter().skip(1).cloned().collect(),
+                env,
+                cwd,
+                stdin: Box::new(stdin),
+                stdout: Box::new(stdout.file()),
+                stderr: Box::new(stderr.file()),
+            },
             &target.command,
             package,
+            injected_packages,
             state.fs.clone(),
+            state.events.clone(),
             wall_time,
         );
 
@@ -564,10 +1077,12 @@ impl PackageCatalog {
 
     fn run_package_command(
         &self,
-        runner: &mut WasiRunner,
+        io: ProcessIo,
         command_name: &str,
         package: &BinaryPackage,
+        injected_packages: Vec<BinaryPackage>,
         root_fs: TmpFileSystem,
+        events: EventBus,
         wall_time: Option<Duration>,
     ) -> Result<i32> {
         let command = package
@@ -578,13 +1093,44 @@ impl PackageCatalog {
             .annotation("wasi")?
             .unwrap_or_else(|| Wasi::new(command_name));
         let exec_name = wasi.exec_name.as_deref().unwrap_or(command_name);
-        let builder = runner.prepare_webc_env(
-            exec_name,
-            &wasi,
-            PackageOrHash::Package(package),
-            RuntimeOrEngine::Runtime(Arc::clone(&self.runtime)),
-            Some(root_fs),
-        )?;
+        let mut builder = WasiEnvBuilder::new(exec_name);
+        builder.set_runtime(Arc::clone(&self.runtime));
+        builder.set_module_hash(package.hash());
+        builder.add_webc(package.clone());
+        builder.include_packages(package.package_ids.clone());
+
+        let package_files = process_package_files(package, &injected_packages)?;
+        for injected_package in injected_packages {
+            builder.add_webc(injected_package.clone());
+            builder.include_packages(injected_package.package_ids.clone());
+        }
+
+        builder.set_current_dir(io.cwd.clone());
+        if let Some(package_cwd) = &wasi.cwd {
+            builder.set_current_dir(package_cwd);
+        }
+
+        if let Some(main_args) = &wasi.main_args {
+            builder.add_args(main_args);
+        }
+        builder.add_args(io.args);
+
+        for item in wasi.env.as_deref().unwrap_or_default() {
+            match item.split_once('=') {
+                Some((key, value)) => builder.add_env(key, value),
+                None => builder.add_env(item, String::new()),
+            }
+        }
+        builder.add_envs(io.env);
+
+        let current_dir = builder.get_current_dir().unwrap_or(PathBuf::from("/"));
+        builder.add_map_dir(".", current_dir)?;
+        builder.add_preopen_dir("/")?;
+        builder.set_fs(process_filesystem(root_fs, package_files, events));
+        builder.set_stdin(io.stdin);
+        builder.set_stdout(io.stdout);
+        builder.set_stderr(io.stderr);
+
         let env = builder.build()?;
         let runtime = env.runtime.clone();
         let process = env.process.clone();
@@ -621,6 +1167,37 @@ impl PackageCatalog {
         })??;
 
         Ok(exit_code.raw())
+    }
+}
+
+fn process_package_files(
+    package: &BinaryPackage,
+    injected_packages: &[BinaryPackage],
+) -> Result<Option<UnionFileSystem>> {
+    let mut package_files = package.webc_fs.as_deref().map(UnionFileSystem::duplicate);
+    for injected_package in injected_packages {
+        let Some(injected_files) = injected_package.webc_fs.as_deref() else {
+            continue;
+        };
+        match &mut package_files {
+            Some(files) => files.merge(injected_files, UnionMergeMode::Skip)?,
+            None => package_files = Some(injected_files.duplicate()),
+        }
+    }
+    Ok(package_files)
+}
+
+fn process_filesystem(
+    root_fs: TmpFileSystem,
+    package_files: Option<UnionFileSystem>,
+    events: EventBus,
+) -> Arc<dyn FileSystem + Send + Sync> {
+    match package_files {
+        Some(files) => {
+            let overlay = OverlayFileSystem::new(root_fs, [RelativeOrAbsolutePathHack(files)]);
+            Arc::new(ObservableFileSystem::new(Arc::new(overlay), events))
+        }
+        None => Arc::new(ObservableFileSystem::new(Arc::new(root_fs), events)),
     }
 }
 
@@ -1068,6 +1645,32 @@ fn create_parent_directories(fs: &TmpFileSystem, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn create_directories(fs: &TmpFileSystem, path: &Path) -> Result<Vec<PathBuf>> {
+    let mut current = PathBuf::from("/");
+    let mut created_paths = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        current.push(name);
+        match fs.metadata(&current) {
+            Ok(metadata) if metadata.is_dir() => continue,
+            Ok(_) => {
+                return Err(anyhow!("path is not a directory: {}", current.display()));
+            }
+            Err(FsError::EntryNotFound) => {}
+            Err(error) => {
+                return Err(anyhow!(error))
+                    .with_context(|| format!("unable to inspect {}", current.display()));
+            }
+        }
+        fs.create_dir(&current)
+            .with_context(|| format!("unable to create {}", current.display()))?;
+        created_paths.push(current.clone());
+    }
+    Ok(created_paths)
+}
+
 async fn read_file_from_fs(fs: &TmpFileSystem, path: &Path) -> Result<Vec<u8>> {
     let mut file = fs.new_open_options().read(true).open(path)?;
     let mut contents = Vec::new();
@@ -1110,6 +1713,21 @@ fn normalize_path(path: &str) -> Result<PathBuf> {
     }
 
     Ok(normalized)
+}
+
+fn event_path(path: &Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Path::new("/").join(path)
+    };
+    let Some(path) = absolute.to_str() else {
+        return absolute.to_string_lossy().to_string();
+    };
+    match normalize_path(path) {
+        Ok(normalized) => normalized.to_string_lossy().to_string(),
+        Err(_) => absolute.to_string_lossy().to_string(),
+    }
 }
 
 fn normalize_command_path(command: &str, cwd: &Path) -> Result<PathBuf> {

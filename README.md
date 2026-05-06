@@ -73,6 +73,7 @@ config = SandboxConfig(
         output_bytes=16 * 1024 * 1024,
         wall_time_seconds=10.0,
     ),
+    event_queue_size=4096,
 )
 ```
 
@@ -120,6 +121,35 @@ For the common "raise on failure and return stdout" shape:
 stdout = await sandbox.check_output(["cat", "/work/generated.txt"])
 text = await sandbox.check_output_text(["python", "-c", "print('ok')"])
 ```
+
+Sandbox filesystem events can be delivered to synchronous or async handlers.
+Handlers run on the asyncio event loop where they are registered, while Wasmer
+process execution only enqueues bounded event data and does not wait for Python
+callbacks.
+
+```python
+from unix_sandbox import SandboxEvent, SandboxEventKind
+
+
+async def on_event(event: SandboxEvent) -> None:
+    print(event.kind, event.path)
+
+
+subscription = sandbox.on_event(
+    on_event,
+    event_types=[SandboxEventKind.FILE_CREATED, SandboxEventKind.FILE_MODIFIED],
+    path_prefix="/work",
+)
+
+await sandbox.run(["bash", "-lc", "printf data > /work/output.txt"], check=True)
+subscription.close()
+```
+
+If handlers fall behind, the queue stays bounded and the stream emits an
+`SandboxEventKind.EVENTS_DROPPED` event with `dropped_count` set. Events are
+reported for filesystem operations performed through the sandbox; external host
+changes made behind a live host mount are visible through the mount but do not
+generate sandbox events.
 
 Commands can be invoked by name through the sandbox `PATH`, or through the
 standard `/bin/<name>` and `/usr/bin/<name>` mappings. Path-like executable

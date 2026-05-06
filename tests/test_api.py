@@ -1,7 +1,31 @@
+import asyncio
 from pathlib import Path
 
 import pytest
-from unix_sandbox import Directory, File, HostMount, Limits, Sandbox, SandboxConfig, SandboxError
+from unix_sandbox import (
+    Directory,
+    File,
+    HostMount,
+    Limits,
+    Sandbox,
+    SandboxConfig,
+    SandboxError,
+    SandboxEvent,
+    SandboxEventKind,
+)
+
+
+async def wait_for_events(events: list[SandboxEvent], count: int) -> None:
+    """Wait until the expected number of events is delivered.
+
+    :param events: Event list populated by a handler.
+    :param count: Expected minimum event count.
+    """
+    for _ in range(100):
+        if len(events) >= count:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"expected at least {count} events, got {events!r}")
 
 
 @pytest.mark.asyncio
@@ -200,6 +224,76 @@ async def test_filesystem_api_round_trip() -> None:
 
     result = await sandbox.run(["cat", "/work/generated/output.txt"], check=True)
     assert result.stdout_text == "written"
+
+
+@pytest.mark.asyncio
+async def test_direct_filesystem_writes_emit_events() -> None:
+    """Verify that direct filesystem writes emit filtered event notifications."""
+    sandbox = Sandbox()
+    events: list[SandboxEvent] = []
+    subscription = sandbox.on_event(
+        events.append,
+        event_types=[
+            SandboxEventKind.DIRECTORY_CREATED,
+            SandboxEventKind.FILE_CREATED,
+            SandboxEventKind.FILE_MODIFIED,
+        ],
+        path_prefix="/work/events",
+    )
+
+    await sandbox.write_text("/work/events/output.txt", "created")
+    await sandbox.write_text("/work/events/output.txt", "modified")
+    await wait_for_events(events, 3)
+    subscription.close()
+
+    assert [event.kind for event in events] == [
+        SandboxEventKind.DIRECTORY_CREATED,
+        SandboxEventKind.FILE_CREATED,
+        SandboxEventKind.FILE_MODIFIED,
+    ]
+    assert [event.path for event in events] == [
+        "/work/events",
+        "/work/events/output.txt",
+        "/work/events/output.txt",
+    ]
+    assert subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_process_filesystem_writes_emit_events() -> None:
+    """Verify that Wasmer process writes emit filesystem notifications."""
+    sandbox = Sandbox()
+    events: list[SandboxEvent] = []
+    sandbox.on_event(
+        events.append,
+        event_types=[SandboxEventKind.FILE_CREATED, SandboxEventKind.FILE_MODIFIED],
+        path_prefix="/work/process.txt",
+    )
+
+    await sandbox.run(
+        ["bash", "-lc", "printf created > /work/process.txt; printf modified >> /work/process.txt"],
+        check=True,
+    )
+    await wait_for_events(events, 2)
+
+    assert events[0].kind == SandboxEventKind.FILE_CREATED
+    assert events[0].path == "/work/process.txt"
+    assert SandboxEventKind.FILE_MODIFIED in {event.kind for event in events}
+    assert await sandbox.read_text("/work/process.txt") == "createdmodified"
+
+
+@pytest.mark.asyncio
+async def test_event_subscription_close_stops_delivery() -> None:
+    """Verify that closed subscriptions stop receiving filesystem events."""
+    sandbox = Sandbox()
+    events: list[SandboxEvent] = []
+    subscription = sandbox.on_event(events.append, path_prefix="/work/closed.txt")
+    subscription.close()
+
+    await sandbox.write_text("/work/closed.txt", "hidden")
+    await asyncio.sleep(0.1)
+
+    assert events == []
 
 
 @pytest.mark.asyncio

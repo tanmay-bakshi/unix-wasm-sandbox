@@ -3670,7 +3670,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "unix-wasm-sandbox"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "once_cell",
