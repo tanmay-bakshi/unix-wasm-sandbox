@@ -3,7 +3,9 @@
 import gzip
 import hashlib
 import json
+import math
 import os
+import tempfile
 from dataclasses import dataclass, field
 from importlib import resources
 from importlib.resources.abc import Traversable
@@ -12,8 +14,6 @@ from types import TracebackType
 from typing import Self
 
 from . import _native
-
-ASSET_NAMES: tuple[str, ...] = ("coreutils", "python")
 
 
 class SandboxError(RuntimeError):
@@ -60,6 +60,16 @@ class Limits:
 
     output_bytes: int = 16 * 1024 * 1024
     wall_time_seconds: float | None = 10.0
+
+    def __post_init__(self) -> None:
+        """:raises ValueError: Raised when a limit value is invalid."""
+        if self.output_bytes < 0:
+            raise ValueError("output_bytes must be greater than or equal to zero")
+        if self.wall_time_seconds is None:
+            return
+        if math.isfinite(self.wall_time_seconds) and self.wall_time_seconds > 0.0:
+            return
+        raise ValueError("wall_time_seconds must be a positive finite number")
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,7 +295,7 @@ def _prepare_asset_dir() -> Path:
     cache_dir = _asset_cache_dir(manifest)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    for name in ASSET_NAMES:
+    for name in manifest:
         spec = manifest[name]
         _expand_asset(source_dir, cache_dir, name, spec["sha256"])
 
@@ -339,26 +349,38 @@ def _expand_asset(
     ):
         return
 
-    temporary = cache_dir / f"{name}.webc.tmp"
     digest = hashlib.sha256()
-    with (
-        source_dir.joinpath(f"{name}.webc.gz").open("rb") as compressed,
-        gzip.GzipFile(fileobj=compressed) as expanded,
-        temporary.open("wb") as output,
-    ):
-        while True:
-            chunk = expanded.read(1024 * 1024)
-            if len(chunk) == 0:
-                break
-            digest.update(chunk)
-            output.write(chunk)
+    temporary: Path | None = None
+    completed = False
+    try:
+        with (
+            source_dir.joinpath(f"{name}.webc.gz").open("rb") as compressed,
+            gzip.GzipFile(fileobj=compressed) as expanded,
+            tempfile.NamedTemporaryFile(
+                "wb",
+                dir=cache_dir,
+                prefix=f"{name}.",
+                suffix=".webc.tmp",
+                delete=False,
+            ) as output,
+        ):
+            temporary = Path(output.name)
+            while True:
+                chunk = expanded.read(1024 * 1024)
+                if len(chunk) == 0:
+                    break
+                digest.update(chunk)
+                output.write(chunk)
 
-    actual_sha256 = digest.hexdigest()
-    if actual_sha256 != expected_sha256:
-        temporary.unlink(missing_ok=True)
-        raise SandboxError(
-            f"{name} asset hash mismatch: expected {expected_sha256}, got {actual_sha256}"
-        )
+        actual_sha256 = digest.hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise SandboxError(
+                f"{name} asset hash mismatch: expected {expected_sha256}, got {actual_sha256}"
+            )
 
-    temporary.replace(destination)
-    marker.write_text(expected_sha256 + "\n", encoding="utf-8")
+        temporary.replace(destination)
+        marker.write_text(expected_sha256 + "\n", encoding="utf-8")
+        completed = True
+    finally:
+        if not completed and temporary is not None:
+            temporary.unlink(missing_ok=True)

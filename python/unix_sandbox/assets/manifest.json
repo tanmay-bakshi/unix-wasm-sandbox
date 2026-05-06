@@ -1,8 +1,38 @@
 {
   "coreutils": {
-    "package": "sharrattj/coreutils",
-    "version": "1.0.16",
-    "sha256": "59b01ca057218b8ab51cab83546d22b729e015d6cf519b2383cc68bce67ef750"
+    "package": "wasmer/coreutils",
+    "version": "1.0.19",
+    "sha256": "36ea48f185ca15fe8454b1defb6a11754659dbed6330549662b62874d509f95f"
+  },
+  "bash": {
+    "package": "wasmer/bash",
+    "version": "1.0.25",
+    "sha256": "830f33d4ac880934d42348f2161a04d376ad0c237208e2ca53a73ad51b269970"
+  },
+  "grep": {
+    "package": "wasmer/grep",
+    "version": "3.12.0",
+    "sha256": "42a2dd5452990c94a51036cfb5eb9574899beccb5ce8f83f75995f7ac5e0e1ca"
+  },
+  "sed": {
+    "package": "wasmer/sed",
+    "version": "4.9.0",
+    "sha256": "3fc12256be87f6b8b7810d68d642359a6220f63b39a2ea6ef7a2bb6d79ec1393"
+  },
+  "find": {
+    "package": "wasmer/find",
+    "version": "4.10.0",
+    "sha256": "89ce490149de27351f18f467f990d3dd8e6ba70be83a819b10361c7b39e4f2fa"
+  },
+  "tar": {
+    "package": "wasmer/tar",
+    "version": "1.35.0",
+    "sha256": "8e53221cd089dfd90e95ed96d2604db01d8d5fba9a9bda1752db27a4b65f5cc7"
+  },
+  "gzip": {
+    "package": "wasmer/gzip",
+    "version": "1.14.0",
+    "sha256": "ebf0160b02f9ef7f586f6c06fc6d36824c9da6467d3e2fa29dbc84df7bbaf5d5"
   },
   "python": {
     "package": "python/python",

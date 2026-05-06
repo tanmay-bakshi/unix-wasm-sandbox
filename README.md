@@ -4,9 +4,10 @@
 running isolated UNIX-like Wasmer environments from async Python code.
 
 The default sandbox starts with an in-memory filesystem, a working directory at
-`/work`, common coreutils, and CPython 3.12.0. Commands run inside Wasmer WASIX
-and expose captured stdin, stdout, stderr, return codes, working directory, and
-environment overrides through a small Python API.
+`/work`, common coreutils, Bash, text/archive utilities, gzip, and CPython
+3.12.0. Commands run inside Wasmer WASIX and expose captured stdin, stdout,
+stderr, return codes, working directory, and environment overrides through a
+small Python API.
 
 ## Install
 
@@ -86,6 +87,9 @@ result = await sandbox.run(
 )
 ```
 
+Captured stdout and stderr are capped while the process writes, so a process
+cannot fill host memory before `Limits.output_bytes` is enforced.
+
 `CompletedProcess` mirrors the useful parts of `subprocess.CompletedProcess`:
 
 - `args`
@@ -110,11 +114,22 @@ stdout = await sandbox.check_output(["cat", "/work/generated.txt"])
 text = await sandbox.check_output_text(["python", "-c", "print('ok')"])
 ```
 
+Commands can be invoked by name through the sandbox `PATH`, or through the
+standard `/bin/<name>` and `/usr/bin/<name>` mappings. Path-like executable
+arguments are not reduced to basenames, so `/no/such/path/cat` is treated as a
+missing executable instead of resolving to `cat`.
+
 ## Standard Image
 
 The bundled standard image is pinned and hash-verified:
 
-- `sharrattj/coreutils@1.0.16`
+- `wasmer/coreutils@1.0.19`
+- `wasmer/bash@1.0.25`
+- `wasmer/grep@3.12.0`
+- `wasmer/sed@4.9.0`
+- `wasmer/find@4.10.0`
+- `wasmer/tar@1.35.0`
+- `wasmer/gzip@1.14.0`
 - `python/python@0.2.0`, CPython 3.12.0
 
 Regenerate the compressed assets with:
@@ -123,7 +138,13 @@ Regenerate the compressed assets with:
 uv run python scripts/fetch_assets.py
 ```
 
+Asset regeneration requires the Wasmer CLI because the bundled Bash package is
+rebuilt after removing registry dependency metadata; the runtime injects the
+standard utility packages itself.
+
 ## Development
+
+This repository pins the Rust toolchain in `rust-toolchain.toml`.
 
 Run the local checks:
 

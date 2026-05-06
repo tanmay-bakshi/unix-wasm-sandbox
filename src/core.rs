@@ -1,15 +1,19 @@
 use std::{
     collections::HashMap,
-    io::SeekFrom,
+    io::{self, SeekFrom},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
 use once_cell::sync::Lazy;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use virtual_fs::{create_dir_all, ArcBoxFile, BufferFile, FileSystem, StaticFile, TmpFileSystem};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncWrite, AsyncWriteExt, ReadBuf};
+use virtual_fs::{
+    create_dir_all, FileSystem, FsError, NullFile, StaticFile, TmpFileSystem, VirtualFile,
+};
 use wasmer::sys::{BaseTunables, Cranelift, EngineBuilder, Features, NativeEngineExt};
 use wasmer_package::utils::from_bytes;
 use wasmer_wasix::{
@@ -27,6 +31,19 @@ use webc::metadata::annotations::Wasi;
 
 static CATALOGS: Lazy<Mutex<HashMap<PathBuf, Arc<PackageCatalog>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+const STANDARD_PACKAGE_NAMES: &[&str] = &[
+    "coreutils",
+    "bash",
+    "grep",
+    "sed",
+    "find",
+    "tar",
+    "gzip",
+    "python",
+];
+
+const COMMAND_PATH_PREFIXES: &[&str] = &["/bin", "/usr/bin"];
 
 #[derive(Clone)]
 pub struct Limits {
@@ -61,7 +78,7 @@ pub struct PackageCatalog {
     runtime: Arc<dyn Runtime + Send + Sync>,
     handle: tokio::runtime::Handle,
     packages: HashMap<String, Arc<BinaryPackage>>,
-    commands: HashMap<String, CommandTarget>,
+    command_paths: HashMap<PathBuf, CommandTarget>,
 }
 
 pub struct RunRequest {
@@ -82,11 +99,18 @@ impl SandboxState {
         let catalog = catalog_for(asset_dir)?;
         let fs = TmpFileSystem::new();
         create_default_layout(&catalog, &fs)?;
+        let cwd = normalize_path(&cwd)?;
+        let cwd = cwd
+            .to_str()
+            .ok_or_else(|| anyhow!("sandbox cwd must be valid UTF-8"))?
+            .to_string();
+        let mut sandbox_env = default_env();
+        sandbox_env.extend(env);
 
         let state = Self {
             fs,
             cwd,
-            env,
+            env: sandbox_env,
             limits,
             catalog,
         };
@@ -174,28 +198,25 @@ impl PackageCatalog {
 
         let runtime = Arc::new(runtime);
         let mut packages = HashMap::new();
-        let mut commands = HashMap::new();
+        let mut command_paths = HashMap::new();
 
-        let coreutils = load_package(&handle, runtime.as_ref(), &asset_dir.join("coreutils.webc"))?;
-        register_package("coreutils", &coreutils, &mut commands);
-        packages.insert("coreutils".to_string(), Arc::new(coreutils));
+        for package_name in STANDARD_PACKAGE_NAMES {
+            let package = load_package(
+                &handle,
+                runtime.as_ref(),
+                &asset_dir.join(format!("{package_name}.webc")),
+            )?;
+            register_package(package_name, &package, &mut command_paths);
+            packages.insert((*package_name).to_string(), Arc::new(package));
+        }
 
-        let python = load_package(&handle, runtime.as_ref(), &asset_dir.join("python.webc"))?;
-        register_package("python", &python, &mut commands);
-        commands.insert(
-            "python3".to_string(),
-            CommandTarget {
-                package: "python".to_string(),
-                command: "python".to_string(),
-            },
-        );
-        packages.insert("python".to_string(), Arc::new(python));
+        register_command_alias("python3", "python", "python", &mut command_paths);
 
         Ok(Arc::new(Self {
             runtime,
             handle,
             packages,
-            commands,
+            command_paths,
         }))
     }
 
@@ -208,26 +229,22 @@ impl PackageCatalog {
             return Err(anyhow!("command arguments cannot be empty"));
         }
 
-        let executable = command_name(&request.args[0])?;
-        let target = self
-            .commands
-            .get(&executable)
-            .ok_or_else(|| anyhow!("command not found: {executable}"))?
-            .clone();
-        let package = self
-            .packages
-            .get(&target.package)
-            .ok_or_else(|| anyhow!("package not loaded: {}", target.package))?;
-        let cwd = request.cwd.unwrap_or_else(|| state.cwd.clone());
-        let cwd = normalize_path(&cwd)?;
-
         let mut env = state.env.clone();
         if let Some(overrides) = request.env {
             env.extend(overrides);
         }
 
-        let stdout = ArcBoxFile::new(Box::new(BufferFile::default()));
-        let stderr = ArcBoxFile::new(Box::new(BufferFile::default()));
+        let cwd = request.cwd.unwrap_or_else(|| state.cwd.clone());
+        let cwd = normalize_path(&cwd)?;
+        validate_directory(&state.fs, &cwd, "cwd")?;
+        let target = self.resolve_command(&request.args[0], &cwd, env.get("PATH"))?;
+        let package = self
+            .packages
+            .get(&target.package)
+            .ok_or_else(|| anyhow!("package not loaded: {}", target.package))?;
+
+        let stdout = CapturedOutput::new(state.limits.output_bytes);
+        let stderr = CapturedOutput::new(state.limits.output_bytes);
         let stdin = StaticFile::new(request.input.unwrap_or_default());
 
         let mut runner = WasiRunner::new();
@@ -235,29 +252,26 @@ impl PackageCatalog {
         runner.with_envs(env);
         runner.with_current_dir(cwd);
         runner.with_stdin(Box::new(stdin));
-        runner.with_stdout(Box::new(stdout.clone()));
-        runner.with_stderr(Box::new(stderr.clone()));
+        runner.with_stdout(Box::new(stdout.file()));
+        runner.with_stderr(Box::new(stderr.file()));
+        runner.with_injected_packages(self.injected_packages(&target.package));
 
         let wall_time = match state.limits.wall_time_seconds {
             Some(seconds) => Some(duration_from_seconds(seconds)?),
             None => None,
         };
-        let returncode = self.run_package_command(
+        let run_result = self.run_package_command(
             &mut runner,
             &target.command,
             package,
             state.fs.clone(),
             wall_time,
-        )?;
+        );
 
-        let stdout = self.capture(stdout)?;
-        let stderr = self.capture(stderr)?;
-        if stdout.len() > state.limits.output_bytes || stderr.len() > state.limits.output_bytes {
-            return Err(anyhow!(
-                "process output exceeded {} bytes",
-                state.limits.output_bytes
-            ));
-        }
+        let stdout = stdout.capture("stdout")?;
+        let stderr = stderr.capture("stderr")?;
+        let returncode = run_result?;
+        let (returncode, stderr) = normalize_process_outcome(&target.command, returncode, stderr);
 
         Ok(CompletedProcess {
             args: request.args,
@@ -267,17 +281,57 @@ impl PackageCatalog {
         })
     }
 
-    fn capture(&self, mut file: ArcBoxFile) -> Result<Vec<u8>> {
-        self.block_on(async move {
-            file.seek(SeekFrom::Start(0))
-                .await
-                .context("unable to rewind captured output")?;
-            let mut output = Vec::new();
-            file.read_to_end(&mut output)
-                .await
-                .context("unable to read captured output")?;
-            Ok(output)
-        })
+    fn resolve_command(
+        &self,
+        command: &str,
+        cwd: &Path,
+        path_env: Option<&String>,
+    ) -> Result<CommandTarget> {
+        if command.as_bytes().contains(&0) {
+            return Err(anyhow!("command cannot contain NUL bytes"));
+        }
+        if command.is_empty() {
+            return Err(anyhow!("command cannot be empty"));
+        }
+
+        if command.contains('/') {
+            let path = normalize_command_path(command, cwd)?;
+            return self
+                .command_paths
+                .get(&path)
+                .cloned()
+                .ok_or_else(|| anyhow!("command not found: {command}"));
+        }
+
+        self.resolve_path_command(command, cwd, path_env)?
+            .ok_or_else(|| anyhow!("command not found: {command}"))
+    }
+
+    fn resolve_path_command(
+        &self,
+        command: &str,
+        cwd: &Path,
+        path_env: Option<&String>,
+    ) -> Result<Option<CommandTarget>> {
+        for directory in path_env.map_or("", String::as_str).split(':') {
+            let candidate = command_path_from_path_entry(directory, command, cwd)?;
+            if let Some(target) = self.command_paths.get(&candidate) {
+                return Ok(Some(target.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn injected_packages(&self, target_package: &str) -> Vec<BinaryPackage> {
+        self.packages
+            .iter()
+            .filter_map(|(name, package)| {
+                if name == target_package {
+                    return None;
+                }
+                Some((**package).clone())
+            })
+            .collect()
     }
 
     fn run_package_command(
@@ -342,6 +396,248 @@ impl PackageCatalog {
     }
 }
 
+#[derive(Clone, Debug)]
+struct CapturedOutput {
+    state: Arc<Mutex<CapturedOutputState>>,
+}
+
+#[derive(Debug)]
+struct CapturedOutputState {
+    data: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+#[derive(Debug)]
+struct LimitedCaptureFile {
+    state: Arc<Mutex<CapturedOutputState>>,
+    cursor: u64,
+}
+
+impl CapturedOutput {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(CapturedOutputState {
+                data: Vec::new(),
+                limit,
+                exceeded: false,
+            })),
+        }
+    }
+
+    fn file(&self) -> LimitedCaptureFile {
+        LimitedCaptureFile {
+            state: Arc::clone(&self.state),
+            cursor: 0,
+        }
+    }
+
+    fn capture(&self, stream_name: &str) -> Result<Vec<u8>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("captured {stream_name} lock failed"))?;
+        if state.exceeded {
+            return Err(anyhow!(
+                "process {stream_name} output exceeded {} bytes",
+                state.limit
+            ));
+        }
+        Ok(state.data.clone())
+    }
+}
+
+impl LimitedCaptureFile {
+    fn write_limited(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("captured output lock failed"))?;
+        if state.exceeded {
+            return Err(output_limit_error(state.limit));
+        }
+
+        let available = state.limit.saturating_sub(state.data.len());
+        if available == 0 {
+            state.exceeded = true;
+            return Err(output_limit_error(state.limit));
+        }
+
+        let write_len = available.min(buf.len());
+        state.data.extend_from_slice(&buf[..write_len]);
+        self.cursor = state.data.len() as u64;
+
+        if write_len < buf.len() {
+            state.exceeded = true;
+        }
+
+        Ok(write_len)
+    }
+}
+
+impl AsyncSeek for LimitedCaptureFile {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("captured output lock failed"))?;
+        let len = state.data.len() as i128;
+        let current = self.cursor as i128;
+        let next = match position {
+            SeekFrom::Start(offset) => offset as i128,
+            SeekFrom::End(offset) => len + offset as i128,
+            SeekFrom::Current(offset) => current + offset as i128,
+        };
+        if next < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid seek before start",
+            ));
+        }
+        drop(state);
+        self.cursor = next as u64;
+        Ok(())
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<u64>> {
+        Poll::Ready(Ok(self.cursor))
+    }
+}
+
+impl AsyncWrite for LimitedCaptureFile {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(self.write_limited(buf))
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        for candidate in bufs {
+            if !candidate.is_empty() {
+                return Poll::Ready(self.write_limited(candidate));
+            }
+        }
+        Poll::Ready(self.write_limited(&[]))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for LimitedCaptureFile {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(io::Error::other("captured output lock failed"))),
+        };
+        let start = (self.cursor as usize).min(state.data.len());
+        let available = &state.data[start..];
+        let read_len = available.len().min(buf.remaining());
+        buf.put_slice(&available[..read_len]);
+        drop(state);
+        self.cursor += read_len as u64;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl VirtualFile for LimitedCaptureFile {
+    fn last_accessed(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn last_modified(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn created_time(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn size(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.data.len() as u64)
+            .unwrap_or_default()
+    }
+
+    fn set_len(&mut self, new_size: u64) -> virtual_fs::Result<()> {
+        let mut state = self.state.lock().map_err(|_| FsError::Lock)?;
+        if new_size > state.limit as u64 {
+            state.exceeded = true;
+            return Err(FsError::StorageFull);
+        }
+        state.data.resize(new_size as usize, 0);
+        self.cursor = self.cursor.min(new_size);
+        Ok(())
+    }
+
+    fn unlink(&mut self) -> virtual_fs::Result<()> {
+        Ok(())
+    }
+
+    fn poll_read_ready(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<usize>> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(io::Error::other("captured output lock failed"))),
+        };
+        let remaining = state.data.len().saturating_sub(self.cursor as usize);
+        Poll::Ready(Ok(remaining))
+    }
+
+    fn poll_write_ready(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<usize>> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(io::Error::other("captured output lock failed"))),
+        };
+        if state.exceeded {
+            return Poll::Ready(Err(output_limit_error(state.limit)));
+        }
+        let remaining = state.limit.saturating_sub(state.data.len());
+        if remaining == 0 {
+            state.exceeded = true;
+            return Poll::Ready(Err(output_limit_error(state.limit)));
+        }
+        Poll::Ready(Ok(remaining.min(8192)))
+    }
+}
+
+fn output_limit_error(limit: usize) -> io::Error {
+    io::Error::other(format!("process output exceeded {limit} bytes"))
+}
+
+fn normalize_process_outcome(command: &str, returncode: i32, stderr: Vec<u8>) -> (i32, Vec<u8>) {
+    const FIND_CWD_RESTORE_ERROR: &[u8] =
+        b"(null): Failed to restore initial working directory: Not a directory\n";
+
+    if command == "find" && returncode == 1 && stderr == FIND_CWD_RESTORE_ERROR {
+        return (0, Vec::new());
+    }
+
+    (returncode, stderr)
+}
+
 fn catalog_for(asset_dir: String) -> Result<Arc<PackageCatalog>> {
     let asset_dir = PathBuf::from(asset_dir)
         .canonicalize()
@@ -380,16 +676,25 @@ fn load_package(
 fn register_package(
     name: &str,
     package: &BinaryPackage,
-    commands: &mut HashMap<String, CommandTarget>,
+    command_paths: &mut HashMap<PathBuf, CommandTarget>,
 ) {
     for command in &package.commands {
-        commands.insert(
-            command.name().to_string(),
-            CommandTarget {
-                package: name.to_string(),
-                command: command.name().to_string(),
-            },
-        );
+        register_command_alias(command.name(), name, command.name(), command_paths);
+    }
+}
+
+fn register_command_alias(
+    alias: &str,
+    package: &str,
+    command: &str,
+    command_paths: &mut HashMap<PathBuf, CommandTarget>,
+) {
+    let target = CommandTarget {
+        package: package.to_string(),
+        command: command.to_string(),
+    };
+    for prefix in COMMAND_PATH_PREFIXES {
+        command_paths.insert(Path::new(prefix).join(alias), target.clone());
     }
 }
 
@@ -415,7 +720,17 @@ fn duration_from_seconds(seconds: f64) -> Result<Duration> {
 }
 
 fn create_default_layout(catalog: &PackageCatalog, fs: &TmpFileSystem) -> Result<()> {
-    for path in ["/tmp", "/work", "/home", "/home/sandbox", "/etc"] {
+    for path in [
+        "/bin",
+        "/usr",
+        "/usr/bin",
+        "/dev",
+        "/tmp",
+        "/work",
+        "/home",
+        "/home/sandbox",
+        "/etc",
+    ] {
         create_dir_all(fs, Path::new(path)).with_context(|| format!("unable to create {path}"))?;
     }
     catalog.block_on(write_file_to_fs(
@@ -428,7 +743,58 @@ fn create_default_layout(catalog: &PackageCatalog, fs: &TmpFileSystem) -> Result
         Path::new("/etc/group"),
         b"sandbox:x:1000:\n".to_vec(),
     ))?;
+    fs.new_open_options_ext()
+        .insert_device_file(PathBuf::from("/dev/null"), Box::<NullFile>::default())
+        .context("unable to create /dev/null")?;
     Ok(())
+}
+
+fn default_env() -> HashMap<String, String> {
+    HashMap::from([
+        ("HOME".to_string(), "/home/sandbox".to_string()),
+        ("LANG".to_string(), "C.UTF-8".to_string()),
+        ("LOGNAME".to_string(), "sandbox".to_string()),
+        ("PATH".to_string(), "/bin:/usr/bin".to_string()),
+        ("TMPDIR".to_string(), "/tmp".to_string()),
+        ("USER".to_string(), "sandbox".to_string()),
+    ])
+}
+
+fn command_path_from_path_entry(directory: &str, command: &str, cwd: &Path) -> Result<PathBuf> {
+    let command_path = if directory.is_empty() || directory == "." {
+        cwd.join(command)
+    } else {
+        Path::new(directory).join(command)
+    };
+    let command_path = command_path
+        .to_str()
+        .ok_or_else(|| anyhow!("command path must be valid UTF-8"))?;
+
+    if command_path.starts_with('/') {
+        return normalize_path(command_path);
+    }
+
+    normalize_command_path(command_path, cwd)
+}
+
+fn validate_directory(fs: &TmpFileSystem, path: &Path, name: &str) -> Result<()> {
+    let metadata = match fs.metadata(path) {
+        Ok(metadata) => metadata,
+        Err(FsError::EntryNotFound) => {
+            return Err(anyhow!("{name} does not exist: {}", path.display()));
+        }
+        Err(FsError::BaseNotDirectory | FsError::NotAFile) => {
+            return Err(anyhow!("{name} is not a directory: {}", path.display()));
+        }
+        Err(error) => {
+            return Err(anyhow!(error))
+                .with_context(|| format!("unable to inspect {name}: {}", path.display()));
+        }
+    };
+    if metadata.is_dir() {
+        return Ok(());
+    }
+    Err(anyhow!("{name} is not a directory: {}", path.display()))
 }
 
 fn create_parent_directories(fs: &TmpFileSystem, path: &Path) -> Result<()> {
@@ -483,13 +849,79 @@ fn normalize_path(path: &str) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn command_name(command: &str) -> Result<String> {
-    let command = command
-        .rsplit('/')
-        .next()
-        .ok_or_else(|| anyhow!("command cannot be empty"))?;
-    if command.is_empty() {
-        return Err(anyhow!("command cannot be empty"));
+fn normalize_command_path(command: &str, cwd: &Path) -> Result<PathBuf> {
+    if command.starts_with('/') {
+        return normalize_path(command);
     }
-    Ok(command.to_string())
+
+    let mut path = cwd.to_path_buf();
+    for component in command.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            if !path.pop() {
+                return Err(anyhow!("command paths cannot escape root"));
+            }
+            continue;
+        }
+        path.push(component);
+    }
+
+    normalize_path(
+        path.to_str()
+            .ok_or_else(|| anyhow!("command path must be valid UTF-8"))?,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn limited_capture_stops_storing_at_limit() {
+        let captured = CapturedOutput::new(4);
+        let mut file = captured.file();
+
+        file.write_all(b"abcdef").await.unwrap_err();
+
+        let state = captured.state.lock().expect("capture state should lock");
+        assert_eq!(state.data, b"abcd");
+        assert!(state.exceeded);
+    }
+
+    #[test]
+    fn command_path_normalization_uses_cwd_for_relative_paths() {
+        let path = normalize_command_path("./tool", Path::new("/work")).unwrap();
+        assert_eq!(path, PathBuf::from("/work/tool"));
+    }
+
+    #[test]
+    fn path_entries_resolve_like_sandbox_paths() {
+        let absolute = command_path_from_path_entry("/bin", "cat", Path::new("/work")).unwrap();
+        assert_eq!(absolute, PathBuf::from("/bin/cat"));
+
+        let current = command_path_from_path_entry("", "cat", Path::new("/bin")).unwrap();
+        assert_eq!(current, PathBuf::from("/bin/cat"));
+
+        let relative = command_path_from_path_entry("usr/bin", "cat", Path::new("/")).unwrap();
+        assert_eq!(relative, PathBuf::from("/usr/bin/cat"));
+    }
+
+    #[test]
+    fn find_cleanup_error_is_normalized_only_when_exact() {
+        let cleanup_error =
+            b"(null): Failed to restore initial working directory: Not a directory\n".to_vec();
+        let (returncode, stderr) = normalize_process_outcome("find", 1, cleanup_error);
+        assert_eq!(returncode, 0);
+        assert_eq!(stderr, b"");
+
+        let real_error = b"find: missing argument\n(null): Failed to restore initial working directory: Not a directory\n"
+            .to_vec();
+        let (returncode, stderr) = normalize_process_outcome("find", 1, real_error);
+        assert_eq!(returncode, 1);
+        assert!(stderr.starts_with(b"find: missing argument"));
+    }
 }
