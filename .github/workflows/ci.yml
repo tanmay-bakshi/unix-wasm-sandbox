@@ -24,10 +24,13 @@ jobs:
             os: macos-14
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
       - uses: astral-sh/setup-uv@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Create environment
-        run: uv venv
+        run: uv venv --python python
       - name: Install package
         run: uv pip install -e ".[dev]"
       - name: Check Rust formatting

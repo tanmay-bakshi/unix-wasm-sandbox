@@ -15,6 +15,8 @@ from typing import Self
 
 from . import _native
 
+DEFAULT_WALL_TIME_SECONDS = 30.0
+
 
 class SandboxError(RuntimeError):
     """Error raised when a sandbox operation cannot be completed."""
@@ -59,7 +61,7 @@ class Limits:
     """
 
     output_bytes: int = 16 * 1024 * 1024
-    wall_time_seconds: float | None = 10.0
+    wall_time_seconds: float | None = DEFAULT_WALL_TIME_SECONDS
 
     def __post_init__(self) -> None:
         """:raises ValueError: Raised when a limit value is invalid."""
