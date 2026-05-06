@@ -1,12 +1,14 @@
 """Typed Python facade for the Rust sandbox runtime."""
 
 import asyncio
+import base64
 import gzip
 import hashlib
 import json
 import logging
 import math
 import os
+import struct
 import tempfile
 import traceback
 from collections.abc import Awaitable, Callable, Iterable
@@ -181,54 +183,6 @@ class EventSubscription:
 
 
 @dataclass(frozen=True, slots=True)
-class Limits:
-    """Resource limits applied to sandbox process execution.
-
-    :ivar output_bytes: Maximum captured bytes for each output stream.
-    :ivar wall_time_seconds: Maximum wall-clock time for a process.
-    """
-
-    output_bytes: int = 16 * 1024 * 1024
-    wall_time_seconds: float | None = DEFAULT_WALL_TIME_SECONDS
-
-    def __post_init__(self) -> None:
-        """:raises ValueError: Raised when a limit value is invalid."""
-        if self.output_bytes < 0:
-            raise ValueError("output_bytes must be greater than or equal to zero")
-        if self.wall_time_seconds is None:
-            return
-        if math.isfinite(self.wall_time_seconds) and self.wall_time_seconds > 0.0:
-            return
-        raise ValueError("wall_time_seconds must be a positive finite number")
-
-
-@dataclass(frozen=True, slots=True)
-class SandboxConfig:
-    """Configuration for a sandbox instance.
-
-    :ivar files: Filesystem entries to create before commands run.
-    :ivar host_mounts: Live host directory mounts to expose inside the sandbox.
-    :ivar cwd: Default working directory.
-    :ivar env: Default environment variables.
-    :ivar limits: Default resource limits.
-    :ivar event_queue_size: Maximum queued filesystem events before overflow.
-    """
-
-    files: dict[str, File | Directory] = field(default_factory=dict)
-    host_mounts: list[HostMount] = field(default_factory=list)
-    cwd: str = "/work"
-    env: dict[str, str] = field(default_factory=dict)
-    limits: Limits = field(default_factory=Limits)
-    event_queue_size: int = DEFAULT_EVENT_QUEUE_SIZE
-
-    def __post_init__(self) -> None:
-        """:raises ValueError: Raised when an event setting is invalid."""
-        if self.event_queue_size > 0:
-            return
-        raise ValueError("event_queue_size must be greater than zero")
-
-
-@dataclass(frozen=True, slots=True)
 class CompletedProcess:
     """A finished sandbox process.
 
@@ -262,6 +216,237 @@ class CompletedProcess:
         )
 
 
+class VirtualProcessOutput:
+    """A bounded output stream for a virtual executable invocation."""
+
+    _chunks: list[bytes]
+    _limit: int
+    _size: int
+
+    def __init__(self, limit: int) -> None:
+        """:param limit: Maximum number of bytes to capture."""
+        self._chunks = []
+        self._limit = limit
+        self._size = 0
+
+    async def write(self, data: bytes | str) -> None:
+        """:param data: Bytes or text to append.
+        :raises SandboxError: Raised when the output limit would be exceeded.
+        """
+        data_bytes = data.encode() if isinstance(data, str) else data
+        self.write_nowait(data_bytes)
+
+    def write_nowait(self, data: bytes | str) -> None:
+        """:param data: Bytes or text to append.
+        :raises SandboxError: Raised when the output limit would be exceeded.
+        """
+        data_bytes = data.encode() if isinstance(data, str) else data
+        next_size = self._size + len(data_bytes)
+        if next_size > self._limit:
+            raise SandboxError(f"virtual executable output exceeded {self._limit} bytes")
+        self._chunks.append(data_bytes)
+        self._size = next_size
+
+    def data(self) -> bytes:
+        """:returns: Captured output bytes."""
+        return b"".join(self._chunks)
+
+
+@dataclass(frozen=True, slots=True)
+class CommandResult:
+    """A result returned by a virtual executable handler.
+
+    :ivar returncode: Process return code.
+    :ivar stdout: Standard output bytes.
+    :ivar stderr: Standard error bytes.
+    """
+
+    returncode: int = 0
+    stdout: bytes = b""
+    stderr: bytes = b""
+
+
+@dataclass(slots=True)
+class CommandInvocation:
+    """A virtual executable invocation.
+
+    :ivar sandbox: Sandbox that owns the executable.
+    :ivar executable_path: Absolute executable path used for dispatch.
+    :ivar argv: Process arguments.
+    :ivar cwd: Current working directory.
+    :ivar env: Environment variables.
+    :ivar stdin: Captured standard input bytes.
+    :ivar stdout: Standard output stream.
+    :ivar stderr: Standard error stream.
+    """
+
+    sandbox: "Sandbox"
+    executable_path: str
+    argv: tuple[str, ...]
+    cwd: str
+    env: dict[str, str]
+    stdin: bytes
+    stdout: VirtualProcessOutput
+    stderr: VirtualProcessOutput
+
+    @property
+    def stdin_text(self) -> str:
+        """:returns: Standard input decoded as UTF-8."""
+        return self.stdin.decode()
+
+    async def run(
+        self,
+        args: list[str] | tuple[str, ...],
+        *,
+        input: bytes | str | None = None,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        check: bool = False,
+    ) -> CompletedProcess:
+        """:param args: Command and arguments.
+        :param input: Bytes or text to pass as stdin.
+        :param env: Environment variable overrides.
+        :param cwd: Working directory override.
+        :param check: Whether to raise on a non-zero return code.
+        :returns: Completed process details.
+        """
+        return await self.sandbox.run(
+            args,
+            input=input,
+            env=env,
+            cwd=self.cwd if cwd is None else cwd,
+            check=check,
+        )
+
+    async def read_file(self, path: str) -> bytes:
+        """:param path: Absolute sandbox path.
+        :returns: File contents.
+        """
+        return await self.sandbox.read_file(path)
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        """:param path: Absolute sandbox path.
+        :param data: File contents.
+        """
+        await self.sandbox.write_file(path, data)
+
+    async def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:
+        """:param path: Absolute sandbox path.
+        :param text: Text to write.
+        :param encoding: Encoding to use.
+        """
+        await self.sandbox.write_text(path, text, encoding)
+
+
+VirtualExecutableResult = int | CommandResult | CompletedProcess | None
+VirtualExecutableHandler = Callable[
+    [CommandInvocation],
+    Awaitable[VirtualExecutableResult] | VirtualExecutableResult,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class VirtualExecutable:
+    """A host-backed executable exposed inside the sandbox.
+
+    :ivar path: Absolute executable path.
+    :ivar handler: Function that implements the executable.
+    :ivar aliases: Additional absolute executable paths handled by the same function.
+    :ivar replace: Whether an existing file at a configured path may be replaced.
+    """
+
+    path: str
+    handler: VirtualExecutableHandler
+    aliases: tuple[str, ...] = ()
+    replace: bool = False
+
+    def __post_init__(self) -> None:
+        """:raises ValueError: Raised when a configured path is invalid."""
+        _normalize_virtual_executable_paths(self.path, self.aliases)
+
+
+class VirtualExecutableRegistration:
+    """A handle for removing a virtual executable."""
+
+    _sandbox: "Sandbox"
+    _token: int
+    _closed: bool
+
+    def __init__(self, sandbox: "Sandbox", token: int) -> None:
+        """:param sandbox: Sandbox that owns the virtual executable.
+        :param token: Handler token to remove.
+        """
+        self._sandbox = sandbox
+        self._token = token
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        """:returns: Whether the registration has been closed."""
+        return self._closed
+
+    def close(self) -> None:
+        """Remove the virtual executable from its sandbox."""
+        if self._closed:
+            return
+        self._closed = True
+        self._sandbox._remove_virtual_executable(self._token)
+
+    async def aclose(self) -> None:
+        """Remove the virtual executable from its sandbox."""
+        self.close()
+
+
+@dataclass(frozen=True, slots=True)
+class Limits:
+    """Resource limits applied to sandbox process execution.
+
+    :ivar output_bytes: Maximum captured bytes for each output stream.
+    :ivar wall_time_seconds: Maximum wall-clock time for a process.
+    """
+
+    output_bytes: int = 16 * 1024 * 1024
+    wall_time_seconds: float | None = DEFAULT_WALL_TIME_SECONDS
+
+    def __post_init__(self) -> None:
+        """:raises ValueError: Raised when a limit value is invalid."""
+        if self.output_bytes < 0:
+            raise ValueError("output_bytes must be greater than or equal to zero")
+        if self.wall_time_seconds is None:
+            return
+        if math.isfinite(self.wall_time_seconds) and self.wall_time_seconds > 0.0:
+            return
+        raise ValueError("wall_time_seconds must be a positive finite number")
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxConfig:
+    """Configuration for a sandbox instance.
+
+    :ivar files: Filesystem entries to create before commands run.
+    :ivar host_mounts: Live host directory mounts to expose inside the sandbox.
+    :ivar virtual_executables: Host-backed executables to expose inside the sandbox.
+    :ivar cwd: Default working directory.
+    :ivar env: Default environment variables.
+    :ivar limits: Default resource limits.
+    :ivar event_queue_size: Maximum queued filesystem events before overflow.
+    """
+
+    files: dict[str, File | Directory] = field(default_factory=dict)
+    host_mounts: list[HostMount] = field(default_factory=list)
+    virtual_executables: list[VirtualExecutable] = field(default_factory=list)
+    cwd: str = "/work"
+    env: dict[str, str] = field(default_factory=dict)
+    limits: Limits = field(default_factory=Limits)
+    event_queue_size: int = DEFAULT_EVENT_QUEUE_SIZE
+
+    def __post_init__(self) -> None:
+        """:raises ValueError: Raised when an event setting is invalid."""
+        if self.event_queue_size > 0:
+            return
+        raise ValueError("event_queue_size must be greater than zero")
+
+
 class Sandbox:
     """An isolated UNIX-like Wasmer sandbox."""
 
@@ -270,6 +455,9 @@ class Sandbox:
     _event_handlers: dict[int, _EventHandlerRegistration]
     _event_dispatch_task: asyncio.Task[None] | None
     _next_event_handler_token: int
+    _virtual_executable_handlers: dict[int, VirtualExecutableHandler]
+    _virtual_executable_dispatch_task: asyncio.Task[None] | None
+    _next_virtual_executable_token: int
 
     def __init__(self, config: SandboxConfig | None = None) -> None:
         """:param config: Sandbox configuration."""
@@ -277,6 +465,9 @@ class Sandbox:
         self._event_handlers = {}
         self._event_dispatch_task = None
         self._next_event_handler_token = 0
+        self._virtual_executable_handlers = {}
+        self._virtual_executable_dispatch_task = None
+        self._next_virtual_executable_token = 0
         files: dict[str, bytes | None] = {}
         for path, entry in self._config.files.items():
             if isinstance(entry, File):
@@ -299,6 +490,14 @@ class Sandbox:
         except RuntimeError as error:
             raise SandboxError(str(error)) from error
 
+        for executable in self._config.virtual_executables:
+            self.register_executable(
+                executable.path,
+                executable.handler,
+                aliases=executable.aliases,
+                replace=executable.replace,
+            )
+
     async def __aenter__(self) -> Self:
         """:returns: This sandbox."""
         return self
@@ -314,6 +513,120 @@ class Sandbox:
         :param traceback: Traceback raised in the context.
         """
         self.close_event_handlers()
+        self.close_virtual_executables()
+
+    def register_executable(
+        self,
+        path: str,
+        handler: VirtualExecutableHandler,
+        *,
+        aliases: Iterable[str] = (),
+        replace: bool = False,
+    ) -> VirtualExecutableRegistration:
+        """:param path: Absolute executable path.
+        :param handler: Function that implements the executable.
+        :param aliases: Additional absolute executable paths handled by the same function.
+        :param replace: Whether an existing file at a configured path may be replaced.
+        :returns: Registration that removes the executable when closed.
+        :raises SandboxError: Raised when native registration fails.
+        :raises ValueError: Raised when a configured path is invalid.
+        """
+        paths = _normalize_virtual_executable_paths(path, tuple(aliases))
+        token = self._next_virtual_executable_token
+        self._next_virtual_executable_token += 1
+        try:
+            self._native_sandbox.register_virtual_executable(token, paths, replace)
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+        self._virtual_executable_handlers[token] = handler
+        return VirtualExecutableRegistration(self, token)
+
+    def close_virtual_executables(self) -> None:
+        """Remove all virtual executables from the sandbox."""
+        tokens = tuple(self._virtual_executable_handlers)
+        for token in tokens:
+            self._remove_virtual_executable(token)
+
+        task = self._virtual_executable_dispatch_task
+        self._virtual_executable_dispatch_task = None
+        if task is None:
+            return
+        if task.done():
+            return
+        task.cancel()
+
+    def _remove_virtual_executable(self, token: int) -> None:
+        """:param token: Handler token to remove."""
+        self._virtual_executable_handlers.pop(token, None)
+        try:
+            self._native_sandbox.unregister_virtual_executable(token)
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+        if len(self._virtual_executable_handlers) > 0:
+            return
+        task = self._virtual_executable_dispatch_task
+        self._virtual_executable_dispatch_task = None
+        if task is None:
+            return
+        if task.done():
+            return
+        task.cancel()
+
+    def _ensure_virtual_executable_dispatcher(self) -> None:
+        """:raises RuntimeError: Raised when no asyncio loop is running."""
+        if len(self._virtual_executable_handlers) == 0:
+            return
+        task = self._virtual_executable_dispatch_task
+        if task is not None and not task.done():
+            return
+        loop = asyncio.get_running_loop()
+        self._virtual_executable_dispatch_task = loop.create_task(
+            self._dispatch_virtual_processes()
+        )
+
+    async def _dispatch_virtual_processes(self) -> None:
+        """Deliver virtual executable invocations to registered handlers."""
+        while len(self._virtual_executable_handlers) > 0:
+            request_id, payload = await self._native_sandbox.next_virtual_process()
+            response = await self._handle_virtual_process(payload)
+            try:
+                self._native_sandbox.complete_virtual_process(request_id, response)
+            except RuntimeError:
+                LOGGER.error(
+                    "virtual executable response delivery failed\n%s",
+                    traceback.format_exc(),
+                )
+
+    async def _handle_virtual_process(self, payload: bytes) -> bytes:
+        """:param payload: Encoded invocation request.
+        :returns: Encoded invocation response.
+        """
+        try:
+            data = json.loads(payload.decode("utf-8"))
+            token = int(data["handler_token"])
+            handler = self._virtual_executable_handlers[token]
+            invocation = CommandInvocation(
+                sandbox=self,
+                executable_path=str(data["executable_path"]),
+                argv=tuple(str(item) for item in data["argv"]),
+                cwd=str(data["cwd"]),
+                env={str(key): str(value) for key, value in data["env"].items()},
+                stdin=base64.b64decode(str(data["stdin"])),
+                stdout=VirtualProcessOutput(self._config.limits.output_bytes),
+                stderr=VirtualProcessOutput(self._config.limits.output_bytes),
+            )
+            result = handler(invocation)
+            if isinstance(result, Awaitable):
+                result = await result
+            command_result = _normalize_virtual_executable_result(invocation, result)
+        except Exception:
+            formatted = traceback.format_exc()
+            LOGGER.error("virtual executable handler failed\n%s", formatted)
+            command_result = _virtual_handler_error_result(
+                formatted,
+                self._config.limits.output_bytes,
+            )
+        return _encode_virtual_executable_response(command_result)
 
     def on_event(
         self,
@@ -400,6 +713,7 @@ class Sandbox:
         :raises SandboxError: Raised when check is true and the command fails.
         """
         input_bytes = input.encode() if isinstance(input, str) else input
+        self._ensure_virtual_executable_dispatcher()
         try:
             native_result = await self._native_sandbox.run(list(args), input_bytes, env, cwd)
         except RuntimeError as error:
@@ -502,6 +816,115 @@ class Sandbox:
             return await self._native_sandbox.listdir(path)
         except RuntimeError as error:
             raise SandboxError(str(error)) from error
+
+
+def _normalize_virtual_executable_paths(path: str, aliases: Iterable[str]) -> list[str]:
+    """:param path: Primary executable path.
+    :param aliases: Additional executable paths.
+    :returns: Normalized executable paths.
+    :raises ValueError: Raised when a configured path is invalid.
+    """
+    paths = [path, *aliases]
+    normalized: list[str] = []
+    for item in paths:
+        if "\0" in item:
+            raise ValueError("virtual executable path cannot contain NUL bytes")
+        if not item.startswith("/"):
+            raise ValueError("virtual executable path must be absolute")
+        normalized_path = _normalize_absolute_path(item)
+        if normalized_path == "/":
+            raise ValueError("virtual executable path cannot be the sandbox root")
+        if normalized_path in normalized:
+            continue
+        normalized.append(normalized_path)
+    return normalized
+
+
+def _normalize_absolute_path(path: str) -> str:
+    """:param path: Absolute path to normalize.
+    :returns: Normalized absolute path.
+    :raises ValueError: Raised when the path escapes the sandbox root.
+    """
+    components: list[str] = []
+    for component in path.split("/"):
+        if len(component) == 0 or component == ".":
+            continue
+        if component == "..":
+            if len(components) == 0:
+                raise ValueError("path cannot escape the sandbox root")
+            components.pop()
+            continue
+        components.append(component)
+    return "/" + "/".join(components)
+
+
+def _normalize_virtual_executable_result(
+    invocation: CommandInvocation,
+    result: VirtualExecutableResult,
+) -> CommandResult:
+    """:param invocation: Invocation whose output buffers were written.
+    :param result: Handler return value.
+    :returns: Normalized command result.
+    :raises TypeError: Raised when the handler returns an unsupported result.
+    """
+    if result is None:
+        return CommandResult(
+            returncode=0,
+            stdout=invocation.stdout.data(),
+            stderr=invocation.stderr.data(),
+        )
+    if isinstance(result, int):
+        return CommandResult(
+            returncode=result,
+            stdout=invocation.stdout.data(),
+            stderr=invocation.stderr.data(),
+        )
+    if isinstance(result, CompletedProcess):
+        return CommandResult(
+            returncode=result.returncode,
+            stdout=_combine_virtual_output(invocation.stdout, result.stdout),
+            stderr=_combine_virtual_output(invocation.stderr, result.stderr),
+        )
+    if isinstance(result, CommandResult):
+        return CommandResult(
+            returncode=result.returncode,
+            stdout=_combine_virtual_output(invocation.stdout, result.stdout),
+            stderr=_combine_virtual_output(invocation.stderr, result.stderr),
+        )
+    raise TypeError("virtual executable handler returned an unsupported result")
+
+
+def _virtual_handler_error_result(formatted: str, limit: int) -> CommandResult:
+    """:param formatted: Formatted handler traceback.
+    :param limit: Maximum number of stderr bytes to emit.
+    :returns: Error result for a failed virtual executable handler.
+    """
+    stderr = formatted.encode()
+    if len(stderr) <= limit:
+        return CommandResult(returncode=1, stderr=stderr)
+    return CommandResult(returncode=1, stderr=stderr[:limit])
+
+
+def _combine_virtual_output(stream: VirtualProcessOutput, data: bytes) -> bytes:
+    """:param stream: Output stream written by the handler.
+    :param data: Additional result data.
+    :returns: Combined output bytes.
+    :raises SandboxError: Raised when the output limit would be exceeded.
+    """
+    stream.write_nowait(data)
+    return stream.data()
+
+
+def _encode_virtual_executable_response(result: CommandResult) -> bytes:
+    """:param result: Command result to encode.
+    :returns: Encoded native response.
+    """
+    return (
+        b"UXR1"
+        + struct.pack("<iII", result.returncode, len(result.stdout), len(result.stderr))
+        + result.stdout
+        + result.stderr
+    )
 
 
 def _normalize_event_types(

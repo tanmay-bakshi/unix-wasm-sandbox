@@ -7,7 +7,7 @@ use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
 use crate::core::{
     CompletedProcess as CoreCompletedProcess, EventBus, FileSystemEvent, HostMount, Limits,
-    RunRequest, SandboxState,
+    RunRequest, SandboxState, VirtualExecutableBridge, VirtualProcessRequest,
 };
 
 #[pyclass(module = "unix_sandbox._native")]
@@ -38,6 +38,9 @@ pub struct Sandbox {
     state: Arc<Mutex<SandboxState>>,
     events: EventBus,
     event_receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<FileSystemEvent>>>,
+    virtual_process_receiver:
+        Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<VirtualProcessRequest>>>,
+    pending_virtual_processes: Arc<Mutex<HashMap<u64, VirtualProcessRequest>>>,
 }
 
 #[pymethods]
@@ -54,6 +57,8 @@ impl Sandbox {
         event_queue_size: usize,
     ) -> PyResult<Self> {
         let (events, event_receiver) = EventBus::new(event_queue_size);
+        let (virtual_processes, virtual_process_receiver) =
+            VirtualExecutableBridge::new(event_queue_size);
         Ok(Self {
             state: Arc::new(Mutex::new(
                 SandboxState::new(
@@ -74,11 +79,14 @@ impl Sandbox {
                         wall_time_seconds,
                     },
                     events.clone(),
+                    virtual_processes,
                 )
                 .map_err(py_error)?,
             )),
             events,
             event_receiver: Arc::new(tokio::sync::Mutex::new(event_receiver)),
+            virtual_process_receiver: Arc::new(tokio::sync::Mutex::new(virtual_process_receiver)),
+            pending_virtual_processes: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -118,6 +126,58 @@ impl Sandbox {
                 event.dropped_count,
             ))
         })
+    }
+
+    fn register_virtual_executable(
+        &self,
+        token: u64,
+        paths: Vec<String>,
+        replace: bool,
+    ) -> PyResult<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("sandbox state lock failed"))?;
+        state
+            .register_virtual_executable(token, paths, replace)
+            .map_err(py_error)
+    }
+
+    fn unregister_virtual_executable(&self, token: u64) -> PyResult<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("sandbox state lock failed"))?;
+        state.unregister_virtual_executable(token).map_err(py_error)
+    }
+
+    fn next_virtual_process<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let virtual_process_receiver = self.virtual_process_receiver.clone();
+        let pending_virtual_processes = self.pending_virtual_processes.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut receiver = virtual_process_receiver.lock().await;
+            let request = receiver
+                .recv()
+                .await
+                .ok_or_else(|| PyRuntimeError::new_err("virtual process stream closed"))?;
+            let id = request.id;
+            let payload = request.payload.clone();
+            pending_virtual_processes
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("virtual process lock failed"))?
+                .insert(id, request);
+            Ok((id, payload))
+        })
+    }
+
+    fn complete_virtual_process(&self, id: u64, response: Vec<u8>) -> PyResult<()> {
+        let request = self
+            .pending_virtual_processes
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("virtual process lock failed"))?
+            .remove(&id)
+            .ok_or_else(|| PyRuntimeError::new_err("virtual process request not found"))?;
+        request.respond(response).map_err(py_error)
     }
 
     fn exists<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {

@@ -1,6 +1,8 @@
 """Public API for UNIX Wasmer sandboxes."""
 
 from unix_sandbox._api import (
+    CommandInvocation,
+    CommandResult,
     CompletedProcess,
     Directory,
     EventSubscription,
@@ -13,9 +15,15 @@ from unix_sandbox._api import (
     SandboxError,
     SandboxEvent,
     SandboxEventKind,
+    VirtualExecutable,
+    VirtualExecutableHandler,
+    VirtualExecutableRegistration,
+    VirtualProcessOutput,
 )
 
 __all__ = [
+    "CommandInvocation",
+    "CommandResult",
     "CompletedProcess",
     "Directory",
     "EventSubscription",
@@ -28,4 +36,8 @@ __all__ = [
     "SandboxError",
     "SandboxEvent",
     "SandboxEventKind",
+    "VirtualExecutable",
+    "VirtualExecutableHandler",
+    "VirtualExecutableRegistration",
+    "VirtualProcessOutput",
 ]

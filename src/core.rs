@@ -6,18 +6,21 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncWrite, AsyncWriteExt, ReadBuf};
 use virtual_fs::{
-    create_dir_all, host_fs, FileOpener, FileSystem, FsError, NullFile, OpenOptionsConfig,
-    OverlayFileSystem, StaticFile, TmpFileSystem, UnionFileSystem, UnionMergeMode, VirtualFile,
+    create_dir_all, host_fs, DirEntry, FileOpener, FileSystem, FileType, FsError, Metadata,
+    NullFile, OpenOptionsConfig, OverlayFileSystem, ReadDir, StaticFile, TmpFileSystem,
+    UnionFileSystem, UnionMergeMode, VirtualFile,
 };
 use wasmer::sys::{BaseTunables, Cranelift, EngineBuilder, Features, NativeEngineExt};
 use wasmer_package::utils::from_bytes;
@@ -48,6 +51,174 @@ const STANDARD_PACKAGE_NAMES: &[&str] = &[
 ];
 
 const COMMAND_PATH_PREFIXES: &[&str] = &["/bin", "/usr/bin"];
+const VIRTUAL_EXEC_BRIDGE_PATH: &str = "/dev/unix-sandbox-virtual-exec";
+const VIRTUAL_EXECUTABLE_WASM: &str = r#"
+(module
+  (type $errno0 (func (param i32 i32) (result i32)))
+  (type $args_get (func (param i32 i32) (result i32)))
+  (type $environ_get (func (param i32 i32) (result i32)))
+  (type $fd_read (func (param i32 i32 i32 i32) (result i32)))
+  (type $fd_write (func (param i32 i32 i32 i32) (result i32)))
+  (type $fd_fdstat_set_flags (func (param i32 i32) (result i32)))
+  (type $path_open (func (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+  (type $proc_exit (func (param i32)))
+
+  (import "wasi_snapshot_preview1" "args_sizes_get" (func $args_sizes_get (type $errno0)))
+  (import "wasi_snapshot_preview1" "args_get" (func $args_get (type $args_get)))
+  (import "wasi_snapshot_preview1" "environ_sizes_get" (func $environ_sizes_get (type $errno0)))
+  (import "wasi_snapshot_preview1" "environ_get" (func $environ_get (type $environ_get)))
+  (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (type $fd_read)))
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (type $fd_write)))
+  (import "wasi_snapshot_preview1" "fd_fdstat_set_flags" (func $fd_fdstat_set_flags (type $fd_fdstat_set_flags)))
+  (import "wasi_snapshot_preview1" "path_open" (func $path_open (type $path_open)))
+  (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (type $proc_exit)))
+
+  (memory (export "memory") 256)
+
+  (global $argc_ptr i32 (i32.const 0))
+  (global $argv_size_ptr i32 (i32.const 4))
+  (global $nread_ptr i32 (i32.const 8))
+  (global $fd_ptr i32 (i32.const 12))
+  (global $written_ptr i32 (i32.const 16))
+  (global $exec_path i32 (i32.const 128))
+  (global $exec_path_len i32 (i32.const __VIRTUAL_EXEC_PATH_LEN__))
+  (global $iovec i32 (i32.const 512))
+  (global $argv_ptrs i32 (i32.const 1024))
+  (global $argv_buf i32 (i32.const 65536))
+  (global $envc_ptr i32 (i32.const 20))
+  (global $env_size_ptr i32 (i32.const 24))
+  (global $env_ptrs i32 (i32.const 262144))
+  (global $env_buf i32 (i32.const 524288))
+  (global $stdin_buf i32 (i32.const 1048576))
+  (global $stdin_cap i32 (i32.const 1048576))
+  (global $request_buf i32 (i32.const 2097152))
+  (global $response_buf i32 (i32.const 4194304))
+  (global $response_cap i32 (i32.const 8388608))
+
+  (data (i32.const 64) "dev/unix-sandbox-virtual-exec")
+  (data (i32.const 128) "__VIRTUAL_EXEC_PATH__")
+
+  (func $strlen (param $ptr i32) (result i32)
+    (local $cursor i32)
+    (local.set $cursor (local.get $ptr))
+    (block $done
+      (loop $again
+        (br_if $done (i32.eqz (i32.load8_u (local.get $cursor))))
+        (local.set $cursor (i32.add (local.get $cursor) (i32.const 1)))
+        (br $again)))
+    (i32.sub (local.get $cursor) (local.get $ptr)))
+
+  (func $write_record (param $cursor i32) (param $source i32) (result i32)
+    (local $len i32)
+    (local.set $len (call $strlen (local.get $source)))
+    (i32.store (local.get $cursor) (local.get $len))
+    (local.set $cursor (i32.add (local.get $cursor) (i32.const 4)))
+    (memory.copy (local.get $cursor) (local.get $source) (local.get $len))
+    (i32.add (local.get $cursor) (local.get $len)))
+
+  (func $_start (export "_start")
+    (local $cursor i32)
+    (local $index i32)
+    (local $stdin_len i32)
+    (local $chunk i32)
+    (local $fd i32)
+    (local $response_len i32)
+    (local $stdout_len i32)
+    (local $stderr_len i32)
+    (local $returncode i32)
+
+    (drop (call $args_sizes_get (global.get $argc_ptr) (global.get $argv_size_ptr)))
+    (drop (call $args_get (global.get $argv_ptrs) (global.get $argv_buf)))
+    (drop (call $environ_sizes_get (global.get $envc_ptr) (global.get $env_size_ptr)))
+    (drop (call $environ_get (global.get $env_ptrs) (global.get $env_buf)))
+    (drop (call $fd_fdstat_set_flags (i32.const 0) (i32.const 4)))
+
+    (local.set $stdin_len (i32.const 0))
+
+    (local.set $cursor (global.get $request_buf))
+    (i32.store (local.get $cursor) (i32.const 0x31565855))
+    (local.set $cursor (i32.add (local.get $cursor) (i32.const 4)))
+    (i32.store (local.get $cursor) (global.get $exec_path_len))
+    (local.set $cursor (i32.add (local.get $cursor) (i32.const 4)))
+    (memory.copy (local.get $cursor) (global.get $exec_path) (global.get $exec_path_len))
+    (local.set $cursor (i32.add (local.get $cursor) (global.get $exec_path_len)))
+    (i32.store (local.get $cursor) (i32.load (global.get $argc_ptr)))
+    (local.set $cursor (i32.add (local.get $cursor) (i32.const 4)))
+    (i32.store (local.get $cursor) (i32.load (global.get $envc_ptr)))
+    (local.set $cursor (i32.add (local.get $cursor) (i32.const 4)))
+    (i32.store (local.get $cursor) (local.get $stdin_len))
+    (local.set $cursor (i32.add (local.get $cursor) (i32.const 4)))
+
+    (local.set $index (i32.const 0))
+    (block $argv_done
+      (loop $argv_again
+        (br_if $argv_done (i32.ge_u (local.get $index) (i32.load (global.get $argc_ptr))))
+        (local.set
+          $cursor
+          (call $write_record
+            (local.get $cursor)
+            (i32.load (i32.add (global.get $argv_ptrs) (i32.mul (local.get $index) (i32.const 4))))))
+        (local.set $index (i32.add (local.get $index) (i32.const 1)))
+        (br $argv_again)))
+
+    (local.set $index (i32.const 0))
+    (block $env_done
+      (loop $env_again
+        (br_if $env_done (i32.ge_u (local.get $index) (i32.load (global.get $envc_ptr))))
+        (local.set
+          $cursor
+          (call $write_record
+            (local.get $cursor)
+            (i32.load (i32.add (global.get $env_ptrs) (i32.mul (local.get $index) (i32.const 4))))))
+        (local.set $index (i32.add (local.get $index) (i32.const 1)))
+        (br $env_again)))
+
+    (memory.copy (local.get $cursor) (global.get $stdin_buf) (local.get $stdin_len))
+    (local.set $cursor (i32.add (local.get $cursor) (local.get $stdin_len)))
+
+    (drop
+      (call $path_open
+        (i32.const 3)
+        (i32.const 0)
+        (i32.const 64)
+        (i32.const 29)
+        (i32.const 0)
+        (i64.const -1)
+        (i64.const -1)
+        (i32.const 0)
+        (global.get $fd_ptr)))
+    (local.set $fd (i32.load (global.get $fd_ptr)))
+
+    (i32.store (global.get $iovec) (global.get $request_buf))
+    (i32.store
+      (i32.add (global.get $iovec) (i32.const 4))
+      (i32.sub (local.get $cursor) (global.get $request_buf)))
+    (drop (call $fd_write (local.get $fd) (global.get $iovec) (i32.const 1) (global.get $written_ptr)))
+
+    (i32.store (global.get $iovec) (global.get $response_buf))
+    (i32.store (i32.add (global.get $iovec) (i32.const 4)) (global.get $response_cap))
+    (drop (call $fd_read (local.get $fd) (global.get $iovec) (i32.const 1) (global.get $nread_ptr)))
+    (local.set $response_len (i32.load (global.get $nread_ptr)))
+
+    (if (i32.lt_u (local.get $response_len) (i32.const 16))
+      (then (return)))
+    (local.set $returncode (i32.load (i32.add (global.get $response_buf) (i32.const 4))))
+    (local.set $stdout_len (i32.load (i32.add (global.get $response_buf) (i32.const 8))))
+    (local.set $stderr_len (i32.load (i32.add (global.get $response_buf) (i32.const 12))))
+
+    (i32.store (global.get $iovec) (i32.add (global.get $response_buf) (i32.const 16)))
+    (i32.store (i32.add (global.get $iovec) (i32.const 4)) (local.get $stdout_len))
+    (drop (call $fd_write (i32.const 1) (global.get $iovec) (i32.const 1) (global.get $written_ptr)))
+
+    (i32.store
+      (global.get $iovec)
+      (i32.add (i32.add (global.get $response_buf) (i32.const 16)) (local.get $stdout_len)))
+    (i32.store (i32.add (global.get $iovec) (i32.const 4)) (local.get $stderr_len))
+    (drop (call $fd_write (i32.const 2) (global.get $iovec) (i32.const 1) (global.get $written_ptr)))
+
+    (call $proc_exit (local.get $returncode)))
+)
+"#;
 
 #[derive(Clone)]
 pub struct Limits {
@@ -78,12 +249,89 @@ pub struct SandboxState {
     pub limits: Limits,
     pub catalog: Arc<PackageCatalog>,
     pub events: EventBus,
+    pub virtual_executables: VirtualExecutableRegistry,
 }
 
 #[derive(Clone)]
 struct CommandTarget {
     package: String,
     command: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct VirtualProcessRequest {
+    pub id: u64,
+    pub payload: Vec<u8>,
+    response_sender: mpsc::Sender<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VirtualExecutableBridge {
+    inner: Arc<VirtualExecutableBridgeInner>,
+}
+
+#[derive(Debug)]
+struct VirtualExecutableBridgeInner {
+    sender: tokio::sync::mpsc::Sender<VirtualProcessRequest>,
+    sequence: AtomicU64,
+}
+
+#[derive(Clone, Debug)]
+pub struct VirtualExecutableRegistry {
+    inner: Arc<Mutex<VirtualExecutableRegistryInner>>,
+    bridge: VirtualExecutableBridge,
+}
+
+#[derive(Debug, Default)]
+struct VirtualExecutableRegistryInner {
+    paths: HashMap<PathBuf, VirtualExecutableTarget>,
+}
+
+#[derive(Clone, Debug)]
+struct VirtualExecutableTarget {
+    token: u64,
+    path: String,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedVirtualExecutable {
+    token: u64,
+    executable_path: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct VirtualProcessPayload {
+    handler_token: u64,
+    executable_path: String,
+    argv: Vec<String>,
+    cwd: String,
+    env: HashMap<String, String>,
+    stdin: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct GuestVirtualProcessPayload {
+    executable_path: String,
+    argv: Vec<String>,
+    cwd: String,
+    env: HashMap<String, String>,
+    stdin: String,
+}
+
+struct VirtualProcessResponsePayload {
+    returncode: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+struct BinaryCursor<'a> {
+    data: &'a [u8],
+    cursor: usize,
+}
+
+enum ResolvedCommand {
+    Package(CommandTarget),
+    Virtual(ResolvedVirtualExecutable),
 }
 
 pub struct PackageCatalog {
@@ -164,6 +412,22 @@ struct ObservableVirtualFile {
     inner: Box<dyn VirtualFile + Send + Sync + 'static>,
     events: EventBus,
     path: String,
+}
+
+#[derive(Clone, Debug)]
+struct VirtualExecutableFileSystem {
+    inner: Arc<dyn FileSystem + Send + Sync>,
+    registry: VirtualExecutableRegistry,
+    wall_time: Option<Duration>,
+}
+
+#[derive(Debug)]
+struct VirtualExecutableBridgeFile {
+    registry: VirtualExecutableRegistry,
+    wall_time: Option<Duration>,
+    request: Vec<u8>,
+    response: Option<Vec<u8>>,
+    cursor: usize,
 }
 
 #[derive(Debug)]
@@ -254,6 +518,258 @@ impl EventBus {
     }
 }
 
+impl VirtualProcessRequest {
+    pub fn respond(&self, response: Vec<u8>) -> Result<()> {
+        self.response_sender
+            .send(response)
+            .map_err(|_| anyhow!("virtual process response receiver closed"))
+    }
+}
+
+impl VirtualExecutableBridge {
+    pub fn new(capacity: usize) -> (Self, tokio::sync::mpsc::Receiver<VirtualProcessRequest>) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+        (
+            Self {
+                inner: Arc::new(VirtualExecutableBridgeInner {
+                    sender,
+                    sequence: AtomicU64::new(0),
+                }),
+            },
+            receiver,
+        )
+    }
+
+    fn invoke_blocking(&self, payload: Vec<u8>, wall_time: Option<Duration>) -> Result<Vec<u8>> {
+        let id = self.inner.sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.inner
+            .sender
+            .blocking_send(VirtualProcessRequest {
+                id,
+                payload,
+                response_sender,
+            })
+            .map_err(|_| anyhow!("virtual executable dispatcher is closed"))?;
+
+        let response = match wall_time {
+            Some(timeout) => response_receiver
+                .recv_timeout(timeout)
+                .map_err(|_| anyhow!("virtual executable exceeded wall time limit"))?,
+            None => response_receiver
+                .recv()
+                .map_err(|_| anyhow!("virtual executable response channel closed"))?,
+        };
+        Ok(response)
+    }
+}
+
+impl VirtualExecutableRegistry {
+    pub fn new(bridge: VirtualExecutableBridge) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VirtualExecutableRegistryInner::default())),
+            bridge,
+        }
+    }
+
+    pub fn bridge(&self) -> VirtualExecutableBridge {
+        self.bridge.clone()
+    }
+
+    pub fn register(
+        &self,
+        fs: &TmpFileSystem,
+        token: u64,
+        paths: Vec<String>,
+        replace: bool,
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Err(anyhow!("virtual executable paths cannot be empty"));
+        }
+
+        let mut normalized_paths = Vec::with_capacity(paths.len());
+        for path in paths {
+            let normalized = normalize_path(&path)?;
+            if normalized == Path::new("/") {
+                return Err(anyhow!(
+                    "virtual executable path cannot be the sandbox root"
+                ));
+            }
+            normalized_paths.push(normalized);
+        }
+
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("virtual executable registry lock failed"))?;
+        for path in &normalized_paths {
+            if !replace && fs.metadata(path).is_ok() {
+                return Err(anyhow!(
+                    "virtual executable path already exists: {}",
+                    path.display()
+                ));
+            }
+            if !replace && inner.paths.contains_key(path) {
+                return Err(anyhow!(
+                    "virtual executable path is already registered: {}",
+                    path.display()
+                ));
+            }
+        }
+
+        for path in normalized_paths {
+            create_parent_directories(fs, &path)?;
+            let path_string = path
+                .to_str()
+                .ok_or_else(|| anyhow!("virtual executable path must be valid UTF-8"))?
+                .to_string();
+            let executable = virtual_executable_wasm(&path_string)?;
+            write_file_to_fs_blocking(fs, &path, executable.clone())?;
+            inner.paths.insert(
+                path,
+                VirtualExecutableTarget {
+                    token,
+                    path: path_string,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub fn unregister(&self, fs: &TmpFileSystem, token: u64) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("virtual executable registry lock failed"))?;
+        let paths = inner
+            .paths
+            .iter()
+            .filter_map(|(path, target)| {
+                if target.token == token {
+                    return Some(path.clone());
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+
+        for path in paths {
+            inner.paths.remove(&path);
+            if fs.remove_file(&path).is_err() {
+                continue;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_command(
+        &self,
+        command: &str,
+        cwd: &Path,
+        path_env: Option<&String>,
+    ) -> Result<Option<ResolvedVirtualExecutable>> {
+        if command.as_bytes().contains(&0) {
+            return Err(anyhow!("command cannot contain NUL bytes"));
+        }
+        if command.is_empty() {
+            return Err(anyhow!("command cannot be empty"));
+        }
+
+        if command.contains('/') {
+            let path = normalize_command_path(command, cwd)?;
+            return self.resolve_path(&path);
+        }
+
+        for directory in path_env.map_or("", String::as_str).split(':') {
+            let candidate = command_path_from_path_entry(directory, command, cwd)?;
+            if let Some(target) = self.resolve_path(&candidate)? {
+                return Ok(Some(target));
+            }
+        }
+        Ok(None)
+    }
+
+    fn resolve_path(&self, path: &Path) -> Result<Option<ResolvedVirtualExecutable>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("virtual executable registry lock failed"))?;
+        Ok(inner
+            .paths
+            .get(path)
+            .map(|target| ResolvedVirtualExecutable {
+                token: target.token,
+                executable_path: target.path.clone(),
+            }))
+    }
+
+    fn invoke_guest(&self, payload: &[u8], wall_time: Option<Duration>) -> Vec<u8> {
+        match self.invoke_guest_result(payload, wall_time) {
+            Ok(response) => response,
+            Err(error) => virtual_process_error_response(error.to_string()),
+        }
+    }
+
+    fn invoke_guest_result(&self, payload: &[u8], wall_time: Option<Duration>) -> Result<Vec<u8>> {
+        let guest = parse_guest_virtual_process_payload(payload)
+            .context("invalid virtual executable request")?;
+        let executable_path = normalize_path(&guest.executable_path)?;
+        let target = self.resolve_path(&executable_path)?.ok_or_else(|| {
+            anyhow!(
+                "virtual executable is not registered: {}",
+                executable_path.display()
+            )
+        })?;
+        let request = VirtualProcessPayload {
+            handler_token: target.token,
+            executable_path: target.executable_path,
+            argv: guest.argv,
+            cwd: guest.cwd,
+            env: guest.env,
+            stdin: guest.stdin,
+        };
+        let payload = serde_json::to_vec(&request)?;
+        self.bridge.invoke_blocking(payload, wall_time)
+    }
+}
+
+impl<'a> BinaryCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, cursor: 0 }
+    }
+
+    fn expect_magic(&mut self, expected: &[u8]) -> Result<()> {
+        let actual = self.read_bytes(expected.len())?;
+        if actual == expected {
+            return Ok(());
+        }
+        Err(anyhow!("invalid binary payload magic"))
+    }
+
+    fn read_u32(&mut self) -> Result<u32> {
+        let bytes = self.read_bytes(4)?;
+        Ok(u32::from_le_bytes(bytes.try_into()?))
+    }
+
+    fn read_string(&mut self) -> Result<String> {
+        let len = self.read_u32()? as usize;
+        let bytes = self.read_bytes(len)?;
+        String::from_utf8(bytes.to_vec()).context("binary payload string is not UTF-8")
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .cursor
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("binary payload is too large"))?;
+        if end > self.data.len() {
+            return Err(anyhow!("binary payload is truncated"));
+        }
+        let bytes = &self.data[self.cursor..end];
+        self.cursor = end;
+        Ok(bytes)
+    }
+}
+
 impl ReadOnlyFileSystem {
     fn new(inner: Arc<dyn FileSystem + Send + Sync>) -> Self {
         Self { inner }
@@ -263,6 +779,20 @@ impl ReadOnlyFileSystem {
 impl ObservableFileSystem {
     fn new(inner: Arc<dyn FileSystem + Send + Sync>, events: EventBus) -> Self {
         Self { inner, events }
+    }
+}
+
+impl VirtualExecutableFileSystem {
+    fn new(
+        inner: Arc<dyn FileSystem + Send + Sync>,
+        registry: VirtualExecutableRegistry,
+        wall_time: Option<Duration>,
+    ) -> Self {
+        Self {
+            inner,
+            registry,
+            wall_time,
+        }
     }
 }
 
@@ -679,6 +1209,220 @@ impl VirtualFile for ObservableVirtualFile {
     }
 }
 
+impl FileSystem for VirtualExecutableFileSystem {
+    fn readlink(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
+        self.inner.readlink(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> virtual_fs::Result<ReadDir> {
+        let mut entries = self
+            .inner
+            .read_dir(path)?
+            .collect::<virtual_fs::Result<Vec<_>>>()?;
+        if path == Path::new("/dev") {
+            entries.push(DirEntry {
+                path: PathBuf::from(VIRTUAL_EXEC_BRIDGE_PATH),
+                metadata: Ok(virtual_exec_bridge_metadata()),
+            });
+        }
+        Ok(ReadDir::new(entries))
+    }
+
+    fn create_dir(&self, path: &Path) -> virtual_fs::Result<()> {
+        self.inner.create_dir(path)
+    }
+
+    fn remove_dir(&self, path: &Path) -> virtual_fs::Result<()> {
+        self.inner.remove_dir(path)
+    }
+
+    fn rename<'a>(
+        &'a self,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = virtual_fs::Result<()>> + Send + 'a>> {
+        Box::pin(async move { self.inner.rename(from, to).await })
+    }
+
+    fn metadata(&self, path: &Path) -> virtual_fs::Result<Metadata> {
+        if path == Path::new(VIRTUAL_EXEC_BRIDGE_PATH) {
+            return Ok(virtual_exec_bridge_metadata());
+        }
+        self.inner.metadata(path)
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<Metadata> {
+        if path == Path::new(VIRTUAL_EXEC_BRIDGE_PATH) {
+            return Ok(virtual_exec_bridge_metadata());
+        }
+        self.inner.symlink_metadata(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> virtual_fs::Result<()> {
+        if path == Path::new(VIRTUAL_EXEC_BRIDGE_PATH) {
+            return Err(FsError::PermissionDenied);
+        }
+        self.inner.remove_file(path)
+    }
+
+    fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
+        virtual_fs::OpenOptions::new(self)
+    }
+
+    fn mount(
+        &self,
+        name: String,
+        path: &Path,
+        fs: Box<dyn FileSystem + Send + Sync>,
+    ) -> virtual_fs::Result<()> {
+        self.inner.mount(name, path, fs)
+    }
+}
+
+impl FileOpener for VirtualExecutableFileSystem {
+    fn open(
+        &self,
+        path: &Path,
+        config: &OpenOptionsConfig,
+    ) -> virtual_fs::Result<Box<dyn VirtualFile + Send + Sync + 'static>> {
+        if path == Path::new(VIRTUAL_EXEC_BRIDGE_PATH) {
+            if !config.read() || !(config.write() || config.append()) {
+                return Err(FsError::PermissionDenied);
+            }
+            return Ok(Box::new(VirtualExecutableBridgeFile {
+                registry: self.registry.clone(),
+                wall_time: self.wall_time,
+                request: Vec::new(),
+                response: None,
+                cursor: 0,
+            }));
+        }
+
+        self.inner
+            .new_open_options()
+            .options(config.clone())
+            .open(path)
+    }
+}
+
+impl AsyncRead for VirtualExecutableBridgeFile {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.response.is_none() {
+            let request = self.request.clone();
+            let response = self.registry.invoke_guest(&request, self.wall_time);
+            self.response = Some(response);
+            self.cursor = 0;
+        }
+
+        let response = self
+            .response
+            .as_ref()
+            .expect("response should be initialized");
+        let available = &response[self.cursor.min(response.len())..];
+        if available.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+
+        let length = available.len().min(buf.remaining());
+        buf.put_slice(&available[..length]);
+        self.cursor += length;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncSeek for VirtualExecutableBridgeFile {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        let response_len = self.response.as_ref().map_or(0_i128, |response| {
+            i128::try_from(response.len()).unwrap_or(i128::MAX)
+        });
+        let cursor = match position {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::End(offset) => response_len + i128::from(offset),
+            SeekFrom::Current(offset) => {
+                i128::try_from(self.cursor).unwrap_or(i128::MAX) + i128::from(offset)
+            }
+        };
+        if cursor < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot seek before start",
+            ));
+        }
+        self.cursor = usize::try_from(cursor).unwrap_or(usize::MAX);
+        Ok(())
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<u64>> {
+        Poll::Ready(Ok(self.cursor as u64))
+    }
+}
+
+impl AsyncWrite for VirtualExecutableBridgeFile {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.request.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl VirtualFile for VirtualExecutableBridgeFile {
+    fn last_accessed(&self) -> u64 {
+        current_time_nanos()
+    }
+
+    fn last_modified(&self) -> u64 {
+        current_time_nanos()
+    }
+
+    fn created_time(&self) -> u64 {
+        current_time_nanos()
+    }
+
+    fn size(&self) -> u64 {
+        self.response
+            .as_ref()
+            .map_or(0_u64, |response| response.len() as u64)
+    }
+
+    fn set_len(&mut self, _new_size: u64) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn unlink(&mut self) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn is_open(&self) -> bool {
+        true
+    }
+
+    fn poll_read_ready(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(1))
+    }
+
+    fn poll_write_ready(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(1))
+    }
+}
+
 impl<F: FileSystem> RelativeOrAbsolutePathHack<F> {
     fn execute<Func, Ret>(&self, path: &Path, operation: Func) -> virtual_fs::Result<Ret>
     where
@@ -769,6 +1513,7 @@ impl SandboxState {
         asset_dir: String,
         limits: Limits,
         events: EventBus,
+        virtual_processes: VirtualExecutableBridge,
     ) -> Result<Self> {
         let catalog = catalog_for(asset_dir)?;
         let fs = TmpFileSystem::new();
@@ -788,6 +1533,7 @@ impl SandboxState {
             limits,
             catalog,
             events,
+            virtual_executables: VirtualExecutableRegistry::new(virtual_processes),
         };
 
         for (path, contents) in files {
@@ -912,6 +1658,20 @@ impl SandboxState {
         Ok(names)
     }
 
+    pub fn register_virtual_executable(
+        &self,
+        token: u64,
+        paths: Vec<String>,
+        replace: bool,
+    ) -> Result<()> {
+        self.virtual_executables
+            .register(&self.fs, token, paths, replace)
+    }
+
+    pub fn unregister_virtual_executable(&self, token: u64) -> Result<()> {
+        self.virtual_executables.unregister(&self.fs, token)
+    }
+
     pub fn run_blocking(&self, request: RunRequest) -> Result<CompletedProcess> {
         self.catalog.run(self, request)
     }
@@ -968,6 +1728,8 @@ impl PackageCatalog {
             return Err(anyhow!("command arguments cannot be empty"));
         }
 
+        let args = request.args;
+        let input = request.input.unwrap_or_default();
         let mut env = state.env.clone();
         if let Some(overrides) = request.env {
             env.extend(overrides);
@@ -976,7 +1738,16 @@ impl PackageCatalog {
         let cwd = request.cwd.unwrap_or_else(|| state.cwd.clone());
         let cwd = normalize_path(&cwd)?;
         validate_directory(&state.fs, &cwd, "cwd")?;
-        let target = self.resolve_command(&request.args[0], &cwd, env.get("PATH"))?;
+        let wall_time = match state.limits.wall_time_seconds {
+            Some(seconds) => Some(duration_from_seconds(seconds)?),
+            None => None,
+        };
+        let target = match self.resolve_command(state, &args[0], &cwd, env.get("PATH"))? {
+            ResolvedCommand::Virtual(target) => {
+                return self.run_virtual_command(args, input, env, cwd, target, state, wall_time);
+            }
+            ResolvedCommand::Package(target) => target,
+        };
         let package = self
             .packages
             .get(&target.package)
@@ -984,17 +1755,13 @@ impl PackageCatalog {
 
         let stdout = CapturedOutput::new(state.limits.output_bytes);
         let stderr = CapturedOutput::new(state.limits.output_bytes);
-        let stdin = StaticFile::new(request.input.unwrap_or_default());
+        let stdin = StaticFile::new(input);
 
         let injected_packages = self.injected_packages(&target.package);
 
-        let wall_time = match state.limits.wall_time_seconds {
-            Some(seconds) => Some(duration_from_seconds(seconds)?),
-            None => None,
-        };
         let run_result = self.run_package_command(
             ProcessIo {
-                args: request.args.iter().skip(1).cloned().collect(),
+                args: args.iter().skip(1).cloned().collect(),
                 env,
                 cwd,
                 stdin: Box::new(stdin),
@@ -1006,6 +1773,7 @@ impl PackageCatalog {
             injected_packages,
             state.fs.clone(),
             state.events.clone(),
+            state.virtual_executables.clone(),
             wall_time,
         );
 
@@ -1015,24 +1783,69 @@ impl PackageCatalog {
         let (returncode, stderr) = normalize_process_outcome(&target.command, returncode, stderr);
 
         Ok(CompletedProcess {
-            args: request.args,
+            args,
             returncode,
             stdout,
             stderr,
         })
     }
 
+    fn run_virtual_command(
+        &self,
+        args: Vec<String>,
+        input: Vec<u8>,
+        env: HashMap<String, String>,
+        cwd: PathBuf,
+        target: ResolvedVirtualExecutable,
+        state: &SandboxState,
+        wall_time: Option<Duration>,
+    ) -> Result<CompletedProcess> {
+        let cwd = cwd
+            .to_str()
+            .ok_or_else(|| anyhow!("sandbox cwd must be valid UTF-8"))?
+            .to_string();
+        let request = VirtualProcessPayload {
+            handler_token: target.token,
+            executable_path: target.executable_path,
+            argv: args.clone(),
+            cwd,
+            env,
+            stdin: BASE64.encode(input),
+        };
+        let payload = serde_json::to_vec(&request)?;
+        let response = state
+            .virtual_executables
+            .bridge()
+            .invoke_blocking(payload, wall_time)?;
+        let response = decode_virtual_process_response(&response)
+            .context("invalid virtual executable response")?;
+        Ok(CompletedProcess {
+            args,
+            returncode: response.returncode,
+            stdout: response.stdout,
+            stderr: response.stderr,
+        })
+    }
+
     fn resolve_command(
         &self,
+        state: &SandboxState,
         command: &str,
         cwd: &Path,
         path_env: Option<&String>,
-    ) -> Result<CommandTarget> {
+    ) -> Result<ResolvedCommand> {
         if command.as_bytes().contains(&0) {
             return Err(anyhow!("command cannot contain NUL bytes"));
         }
         if command.is_empty() {
             return Err(anyhow!("command cannot be empty"));
+        }
+
+        if let Some(target) = state
+            .virtual_executables
+            .resolve_command(command, cwd, path_env)?
+        {
+            return Ok(ResolvedCommand::Virtual(target));
         }
 
         if command.contains('/') {
@@ -1041,10 +1854,12 @@ impl PackageCatalog {
                 .command_paths
                 .get(&path)
                 .cloned()
+                .map(ResolvedCommand::Package)
                 .ok_or_else(|| anyhow!("command not found: {command}"));
         }
 
         self.resolve_path_command(command, cwd, path_env)?
+            .map(ResolvedCommand::Package)
             .ok_or_else(|| anyhow!("command not found: {command}"))
     }
 
@@ -1083,6 +1898,7 @@ impl PackageCatalog {
         injected_packages: Vec<BinaryPackage>,
         root_fs: TmpFileSystem,
         events: EventBus,
+        virtual_executables: VirtualExecutableRegistry,
         wall_time: Option<Duration>,
     ) -> Result<i32> {
         let command = package
@@ -1126,7 +1942,13 @@ impl PackageCatalog {
         let current_dir = builder.get_current_dir().unwrap_or(PathBuf::from("/"));
         builder.add_map_dir(".", current_dir)?;
         builder.add_preopen_dir("/")?;
-        builder.set_fs(process_filesystem(root_fs, package_files, events));
+        builder.set_fs(process_filesystem(
+            root_fs,
+            package_files,
+            events,
+            virtual_executables,
+            wall_time,
+        ));
         builder.set_stdin(io.stdin);
         builder.set_stdout(io.stdout);
         builder.set_stderr(io.stderr);
@@ -1191,14 +2013,22 @@ fn process_filesystem(
     root_fs: TmpFileSystem,
     package_files: Option<UnionFileSystem>,
     events: EventBus,
+    virtual_executables: VirtualExecutableRegistry,
+    wall_time: Option<Duration>,
 ) -> Arc<dyn FileSystem + Send + Sync> {
-    match package_files {
+    let filesystem: Arc<dyn FileSystem + Send + Sync> = match package_files {
         Some(files) => {
             let overlay = OverlayFileSystem::new(root_fs, [RelativeOrAbsolutePathHack(files)]);
-            Arc::new(ObservableFileSystem::new(Arc::new(overlay), events))
+            Arc::new(overlay)
         }
-        None => Arc::new(ObservableFileSystem::new(Arc::new(root_fs), events)),
-    }
+        None => Arc::new(root_fs),
+    };
+    let filesystem = Arc::new(VirtualExecutableFileSystem::new(
+        filesystem,
+        virtual_executables,
+        wall_time,
+    ));
+    Arc::new(ObservableFileSystem::new(filesystem, events))
 }
 
 #[derive(Clone, Debug)]
@@ -1567,6 +2397,125 @@ fn default_env() -> HashMap<String, String> {
         ("TMPDIR".to_string(), "/tmp".to_string()),
         ("USER".to_string(), "sandbox".to_string()),
     ])
+}
+
+fn virtual_executable_wasm(path: &str) -> Result<Vec<u8>> {
+    let wat = VIRTUAL_EXECUTABLE_WASM
+        .replace("__VIRTUAL_EXEC_PATH_LEN__", &path.len().to_string())
+        .replace("__VIRTUAL_EXEC_PATH__", &wat_string(path.as_bytes()));
+    wat::parse_str(wat).context("unable to build virtual executable launcher")
+}
+
+fn wat_string(data: &[u8]) -> String {
+    let mut output = String::with_capacity(data.len() * 3);
+    for byte in data {
+        output.push('\\');
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+fn virtual_process_error_response(message: String) -> Vec<u8> {
+    encode_virtual_process_response(&VirtualProcessResponsePayload {
+        returncode: 126,
+        stdout: Vec::new(),
+        stderr: format!("{message}\n").into_bytes(),
+    })
+}
+
+fn encode_virtual_process_response(response: &VirtualProcessResponsePayload) -> Vec<u8> {
+    let mut data = Vec::with_capacity(16 + response.stdout.len() + response.stderr.len());
+    data.extend_from_slice(b"UXR1");
+    data.extend_from_slice(&response.returncode.to_le_bytes());
+    data.extend_from_slice(&(response.stdout.len() as u32).to_le_bytes());
+    data.extend_from_slice(&(response.stderr.len() as u32).to_le_bytes());
+    data.extend_from_slice(&response.stdout);
+    data.extend_from_slice(&response.stderr);
+    data
+}
+
+fn decode_virtual_process_response(data: &[u8]) -> Result<VirtualProcessResponsePayload> {
+    if data.len() < 16 || &data[..4] != b"UXR1" {
+        return Err(anyhow!("invalid virtual executable response header"));
+    }
+    let returncode = i32::from_le_bytes(data[4..8].try_into()?);
+    let stdout_len = u32::from_le_bytes(data[8..12].try_into()?) as usize;
+    let stderr_len = u32::from_le_bytes(data[12..16].try_into()?) as usize;
+    let expected_len = 16_usize
+        .checked_add(stdout_len)
+        .and_then(|value| value.checked_add(stderr_len))
+        .ok_or_else(|| anyhow!("virtual executable response is too large"))?;
+    if data.len() < expected_len {
+        return Err(anyhow!("virtual executable response is truncated"));
+    }
+    let stdout_start = 16;
+    let stderr_start = stdout_start + stdout_len;
+    Ok(VirtualProcessResponsePayload {
+        returncode,
+        stdout: data[stdout_start..stderr_start].to_vec(),
+        stderr: data[stderr_start..expected_len].to_vec(),
+    })
+}
+
+fn parse_guest_virtual_process_payload(data: &[u8]) -> Result<GuestVirtualProcessPayload> {
+    let mut cursor = BinaryCursor::new(data);
+    cursor.expect_magic(b"UXV1")?;
+    let executable_path = cursor.read_string()?;
+    let argc = cursor.read_u32()? as usize;
+    let envc = cursor.read_u32()? as usize;
+    let stdin_len = cursor.read_u32()? as usize;
+    let mut argv = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        argv.push(cursor.read_string()?);
+    }
+
+    let mut env = HashMap::with_capacity(envc);
+    for _ in 0..envc {
+        let item = cursor.read_string()?;
+        let Some((key, value)) = item.split_once('=') else {
+            continue;
+        };
+        env.insert(key.to_string(), value.to_string());
+    }
+
+    let stdin = cursor.read_bytes(stdin_len)?;
+    let cwd = env.get("PWD").cloned().unwrap_or_else(|| "/".to_string());
+    Ok(GuestVirtualProcessPayload {
+        executable_path,
+        argv,
+        cwd,
+        env,
+        stdin: BASE64.encode(stdin),
+    })
+}
+
+fn virtual_exec_bridge_metadata() -> Metadata {
+    let time = current_time_nanos();
+    Metadata {
+        ft: FileType::new_file(),
+        accessed: time,
+        created: time,
+        modified: time,
+        len: 0,
+    }
+}
+
+fn current_time_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn write_file_to_fs_blocking(fs: &TmpFileSystem, path: &Path, data: Vec<u8>) -> Result<()> {
+    create_parent_directories(fs, path)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("unable to create filesystem write runtime")?;
+    runtime
+        .block_on(write_file_to_fs(fs, path, data))
+        .with_context(|| format!("unable to write {}", path.display()))
 }
 
 fn command_path_from_path_entry(directory: &str, command: &str, cwd: &Path) -> Result<PathBuf> {

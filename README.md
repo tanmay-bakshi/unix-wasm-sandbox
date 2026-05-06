@@ -151,6 +151,41 @@ reported for filesystem operations performed through the sandbox; external host
 changes made behind a live host mount are visible through the mount but do not
 generate sandbox events.
 
+Virtual executables expose host Python code as executable files inside the
+sandbox. Each configured path is backed by a small WASI/WASM launcher, so shell
+probing, `PATH` lookup, `test -x`, and sandboxed `subprocess.run()` calls see an
+ordinary executable file while invocation is dispatched to a trusted host
+handler.
+
+```python
+from unix_sandbox import CommandInvocation, CommandResult, Sandbox
+
+
+async def tool(invocation: CommandInvocation) -> CommandResult:
+    await invocation.write_text("/work/generated.txt", "created by the host")
+    await invocation.stdout.write(f"argv={invocation.argv!r}\n")
+    return CommandResult(returncode=0)
+
+
+sandbox = Sandbox()
+registration = sandbox.register_executable(
+    "/usr/bin/host-tool",
+    tool,
+    aliases=("/bin/host-tool",),
+)
+
+result = await sandbox.run(["bash", "-lc", "host-tool alpha && cat /work/generated.txt"])
+registration.close()
+```
+
+Handlers receive the owning sandbox, argv, cwd, environment, direct invocation
+stdin, and bounded stdout/stderr streams. They may return `None`, an integer
+return code, `CommandResult`, or `CompletedProcess`. Handler code runs in the
+host process and is intentionally a trusted integration point; sandbox isolation
+applies to the Wasmer guest, not to arbitrary Python handler code. Nested guest
+invocations are conservative about inherited stdin and do not drain the parent
+process descriptor automatically.
+
 Commands can be invoked by name through the sandbox `PATH`, or through the
 standard `/bin/<name>` and `/usr/bin/<name>` mappings. Path-like executable
 arguments are not reduced to basenames, so `/no/such/path/cat` is treated as a

@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 from unix_sandbox import (
+    CommandInvocation,
+    CommandResult,
     Directory,
     File,
     HostMount,
@@ -12,6 +14,7 @@ from unix_sandbox import (
     SandboxError,
     SandboxEvent,
     SandboxEventKind,
+    VirtualExecutable,
 )
 
 
@@ -333,6 +336,200 @@ async def test_writable_host_mount_persists_host_changes(tmp_path: Path) -> None
     )
     assert result.stderr == b""
     assert (tmp_path / "generated.txt").read_text(encoding="utf-8") == "updated"
+
+
+@pytest.mark.asyncio
+async def test_direct_virtual_executable_invokes_handler() -> None:
+    """Verify that direct command execution can be backed by a Python handler."""
+    sandbox = Sandbox()
+    calls: list[CommandInvocation] = []
+
+    async def handler(invocation: CommandInvocation) -> CommandResult:
+        calls.append(invocation)
+        assert invocation.argv == ("host-tool", "arg")
+        assert invocation.cwd == "/tmp"
+        assert invocation.env["VALUE"] == "visible"
+        assert invocation.stdin_text == "payload"
+        await invocation.stdout.write("streamed stdout\n")
+        await invocation.stderr.write("streamed stderr\n")
+        await invocation.write_text("/work/virtual.txt", "created by handler")
+        return CommandResult(returncode=7, stdout=b"returned stdout\n", stderr=b"returned stderr\n")
+
+    sandbox.register_executable(
+        "/usr/bin/host-tool",
+        handler,
+        aliases=("/bin/host-tool",),
+    )
+
+    result = await sandbox.run(
+        ["host-tool", "arg"],
+        input="payload",
+        env={"VALUE": "visible"},
+        cwd="/tmp",
+    )
+
+    assert result.returncode == 7
+    assert result.stdout_text == "streamed stdout\nreturned stdout\n"
+    assert result.stderr_text == "streamed stderr\nreturned stderr\n"
+    assert await sandbox.read_text("/work/virtual.txt") == "created by handler"
+    assert len(calls) == 1
+    assert calls[0].executable_path in {"/bin/host-tool", "/usr/bin/host-tool"}
+
+
+@pytest.mark.asyncio
+async def test_virtual_executable_is_visible_to_shell_and_executes_as_wasm() -> None:
+    """Verify that a virtual executable behaves like an executable file in the sandbox."""
+    sandbox = Sandbox()
+    seen: list[tuple[str, tuple[str, ...]]] = []
+
+    async def handler(invocation: CommandInvocation) -> CommandResult:
+        seen.append((invocation.executable_path, invocation.argv))
+        await invocation.write_text("/work/from-host-tool.txt", "side effect")
+        return CommandResult(returncode=9, stdout=b"handler stdout\n", stderr=b"handler stderr\n")
+
+    sandbox.register_executable(
+        "/usr/bin/host-tool",
+        handler,
+        aliases=("/bin/host-tool",),
+    )
+
+    result = await sandbox.run(
+        [
+            "bash",
+            "-lc",
+            (
+                "command -v host-tool\n"
+                "test -x /usr/bin/host-tool\n"
+                "head -c 4 /usr/bin/host-tool | od -An -tx1\n"
+                "host-tool shell\n"
+                "printf 'rc:%s\\n' \"$?\"\n"
+                "cat /work/from-host-tool.txt\n"
+            ),
+        ],
+    )
+
+    assert result.returncode == 0
+    assert "handler stderr\n" in result.stderr_text
+    lines = result.stdout_text.splitlines()
+    assert lines[0] in {"/bin/host-tool", "/usr/bin/host-tool"}
+    assert lines[1].strip() == "00 61 73 6d"
+    assert lines[2] == "handler stdout"
+    assert lines[3] == "rc:9"
+    assert lines[4] == "side effect"
+    assert seen == [(lines[0], ("host-tool", "shell"))]
+
+
+@pytest.mark.asyncio
+async def test_virtual_executable_can_be_configured_on_sandbox_config() -> None:
+    """Verify that virtual executables can be part of sandbox construction."""
+
+    async def handler(invocation: CommandInvocation) -> CommandResult:
+        return CommandResult(stdout=f"configured:{invocation.argv[1]}\n".encode())
+
+    sandbox = Sandbox(
+        SandboxConfig(
+            virtual_executables=[
+                VirtualExecutable(
+                    "/usr/bin/config-tool",
+                    handler,
+                    aliases=("/bin/config-tool",),
+                ),
+            ],
+        ),
+    )
+
+    result = await sandbox.run(["config-tool", "ok"], check=True)
+    assert result.stdout_text == "configured:ok\n"
+
+
+@pytest.mark.asyncio
+async def test_virtual_executable_registration_close_removes_command() -> None:
+    """Verify that closing a registration removes its executable paths."""
+    sandbox = Sandbox()
+
+    async def handler(invocation: CommandInvocation) -> CommandResult:
+        return CommandResult(stdout=b"active\n")
+
+    registration = sandbox.register_executable(
+        "/usr/bin/closed-tool",
+        handler,
+        aliases=("/bin/closed-tool",),
+    )
+
+    active = await sandbox.run(["closed-tool"], check=True)
+    assert active.stdout_text == "active\n"
+
+    registration.close()
+    assert registration.closed is True
+
+    with pytest.raises(SandboxError, match="command not found"):
+        await sandbox.run(["closed-tool"])
+
+
+@pytest.mark.asyncio
+async def test_sandbox_python_subprocess_can_spawn_virtual_executable() -> None:
+    """Verify that sandboxed Python subprocesses can invoke host-backed executables."""
+    sandbox = Sandbox()
+    invocations: list[CommandInvocation] = []
+
+    async def handler(invocation: CommandInvocation) -> CommandResult:
+        invocations.append(invocation)
+        return CommandResult(returncode=13, stdout=b"from handler\n", stderr=b"handler err\n")
+
+    sandbox.register_executable(
+        "/usr/bin/python-tool",
+        handler,
+        aliases=("/bin/python-tool",),
+    )
+
+    await sandbox.run(
+        [
+            "python",
+            "-c",
+            'import subprocess; subprocess.run(["echo", "warm"], capture_output=True)',
+        ],
+        check=True,
+    )
+    result = await sandbox.run(
+        [
+            "python",
+            "-c",
+            (
+                "import subprocess, sys\n"
+                "process = subprocess.run(['python-tool', 'child'], capture_output=True)\n"
+                "print(process.returncode)\n"
+                "sys.stdout.buffer.write(process.stdout)\n"
+                "sys.stderr.buffer.write(process.stderr)\n"
+            ),
+        ],
+        check=True,
+    )
+
+    assert result.stdout_text == "13\nfrom handler\n"
+    assert result.stderr_text == "handler err\n"
+    assert len(invocations) == 1
+    assert invocations[0].argv == ("python-tool", "child")
+
+
+@pytest.mark.asyncio
+async def test_virtual_executable_handler_failures_respect_output_limit() -> None:
+    """Verify that handler exceptions are reported without bypassing output limits."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(output_bytes=32)))
+
+    async def handler(invocation: CommandInvocation) -> CommandResult:
+        raise RuntimeError("handler failure")
+
+    sandbox.register_executable(
+        "/usr/bin/failing-tool",
+        handler,
+        aliases=("/bin/failing-tool",),
+    )
+
+    result = await sandbox.run(["failing-tool"])
+
+    assert result.returncode == 1
+    assert len(result.stderr) == 32
+    assert result.stderr_text.startswith("Traceback")
 
 
 def test_host_mount_rejects_relative_targets(tmp_path: Path) -> None:
