@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate Tag
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - id: version
+        name: Validate Version Metadata
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          tag_match = re.fullmatch(r"v([0-9]+)\.([0-9]+)\.([0-9]+)", tag)
+          if tag_match is None:
+              raise SystemExit(f"release tags must look like v0.0.0, got {tag!r}")
+
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+
+          package_version = pyproject["project"]["version"]
+          cargo_version = cargo["package"]["version"]
+          if cargo_version != package_version:
+              raise SystemExit(
+                  f"Cargo.toml version {cargo_version} does not match pyproject.toml "
+                  f"version {package_version}",
+              )
+
+          expected_tag = f"v{package_version}"
+          if tag != expected_tag:
+              raise SystemExit(f"tag {tag} does not match package version {expected_tag}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={package_version}\n")
+          PY
+
+  linux-wheels:
+    name: Linux x64 / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-22.04
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          args: >-
+            --release
+            --locked
+            --out dist
+            --interpreter python${{ matrix.python-version }}
+          manylinux: auto
+      - name: Upload Wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-x86_64-py${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  macos-wheels:
+    name: ${{ matrix.platform.name }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.platform.os }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+        platform:
+          - name: macOS x64
+            os: macos-15-intel
+            target: x86_64
+          - name: macOS arm64
+            os: macos-14
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Build Wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: >-
+            --release
+            --locked
+            --out dist
+            --interpreter python
+      - name: Upload Wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}-py${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Source Distribution
+    runs-on: ubuntu-22.04
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Source Distribution
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Upload Source Distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-22.04
+    needs:
+      - validate
+      - linux-wheels
+      - macos-wheels
+      - sdist
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
