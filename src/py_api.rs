@@ -6,8 +6,8 @@ use std::{
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
 use crate::core::{
-    CompletedProcess as CoreCompletedProcess, EventBus, FileSystemEvent, HostMount, Limits,
-    RunRequest, SandboxState, VirtualExecutableBridge, VirtualProcessRequest,
+    CancellationSource, CompletedProcess as CoreCompletedProcess, EventBus, FileSystemEvent,
+    HostMount, Limits, RunRequest, SandboxState, VirtualExecutableBridge, VirtualProcessRequest,
 };
 
 #[pyclass(module = "unix_sandbox._native")]
@@ -30,6 +30,31 @@ impl From<CoreCompletedProcess> for CompletedProcess {
             stdout: process.stdout,
             stderr: process.stderr,
         }
+    }
+}
+
+struct CancellationGuard {
+    source: Option<CancellationSource>,
+}
+
+impl CancellationGuard {
+    fn new(source: CancellationSource) -> Self {
+        Self {
+            source: Some(source),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.source = None;
+    }
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        let Some(source) = self.source.take() else {
+            return;
+        };
+        source.cancel();
     }
 }
 
@@ -180,6 +205,24 @@ impl Sandbox {
         request.respond(response).map_err(py_error)
     }
 
+    fn wait_virtual_process_cancelled<'py>(
+        &self,
+        py: Python<'py>,
+        id: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut cancellation = self
+            .pending_virtual_processes
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("virtual process lock failed"))?
+            .get(&id)
+            .ok_or_else(|| PyRuntimeError::new_err("virtual process request not found"))?
+            .cancellation_token();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            cancellation.cancelled().await;
+            Ok(())
+        })
+    }
+
     fn exists<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let state = self.state.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -236,22 +279,30 @@ impl Sandbox {
         cwd: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = self.state.clone();
+        let cancellation_source = CancellationSource::new();
+        let cancellation = cancellation_source.token();
+        let cancellation_guard = CancellationGuard::new(cancellation_source);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut cancellation_guard = cancellation_guard;
             let state = state
                 .lock()
                 .map_err(|_| PyRuntimeError::new_err("sandbox state lock failed"))?
                 .clone();
             let process = tokio::task::spawn_blocking(move || {
-                state.run_blocking(RunRequest {
-                    args,
-                    input,
-                    env,
-                    cwd,
-                })
+                state.run_blocking(
+                    RunRequest {
+                        args,
+                        input,
+                        env,
+                        cwd,
+                    },
+                    cancellation,
+                )
             })
             .await
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
-            .map_err(py_error)?;
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            cancellation_guard.disarm();
+            let process = process.map_err(py_error)?;
 
             Ok(CompletedProcess::from(process))
         })

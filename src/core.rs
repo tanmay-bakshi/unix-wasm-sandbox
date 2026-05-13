@@ -9,7 +9,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -241,6 +241,16 @@ pub struct CompletedProcess {
     pub stderr: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub struct CancellationSource {
+    sender: tokio::sync::watch::Sender<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CancellationToken {
+    receiver: tokio::sync::watch::Receiver<bool>,
+}
+
 #[derive(Clone)]
 pub struct SandboxState {
     pub fs: TmpFileSystem,
@@ -262,6 +272,7 @@ struct CommandTarget {
 pub struct VirtualProcessRequest {
     pub id: u64,
     pub payload: Vec<u8>,
+    cancellation: CancellationToken,
     response_sender: mpsc::Sender<Vec<u8>>,
 }
 
@@ -419,12 +430,14 @@ struct VirtualExecutableFileSystem {
     inner: Arc<dyn FileSystem + Send + Sync>,
     registry: VirtualExecutableRegistry,
     wall_time: Option<Duration>,
+    cancellation: CancellationToken,
 }
 
 #[derive(Debug)]
 struct VirtualExecutableBridgeFile {
     registry: VirtualExecutableRegistry,
     wall_time: Option<Duration>,
+    cancellation: CancellationToken,
     request: Vec<u8>,
     response: Option<Vec<u8>>,
     cursor: usize,
@@ -518,7 +531,46 @@ impl EventBus {
     }
 }
 
+impl CancellationSource {
+    pub fn new() -> Self {
+        let (sender, _receiver) = tokio::sync::watch::channel(false);
+        Self { sender }
+    }
+
+    pub fn token(&self) -> CancellationToken {
+        CancellationToken {
+            receiver: self.sender.subscribe(),
+        }
+    }
+
+    pub fn cancel(&self) {
+        let _ = self.sender.send(true);
+    }
+}
+
+impl CancellationToken {
+    pub fn is_cancelled(&self) -> bool {
+        *self.receiver.borrow()
+    }
+
+    pub async fn cancelled(&mut self) {
+        if self.is_cancelled() {
+            return;
+        }
+
+        while self.receiver.changed().await.is_ok() {
+            if self.is_cancelled() {
+                return;
+            }
+        }
+    }
+}
+
 impl VirtualProcessRequest {
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
     pub fn respond(&self, response: Vec<u8>) -> Result<()> {
         self.response_sender
             .send(response)
@@ -540,27 +592,72 @@ impl VirtualExecutableBridge {
         )
     }
 
-    fn invoke_blocking(&self, payload: Vec<u8>, wall_time: Option<Duration>) -> Result<Vec<u8>> {
+    fn invoke_blocking(
+        &self,
+        payload: Vec<u8>,
+        wall_time: Option<Duration>,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<u8>> {
         let id = self.inner.sequence.fetch_add(1, Ordering::AcqRel) + 1;
         let (response_sender, response_receiver) = mpsc::channel();
-        self.inner
-            .sender
-            .blocking_send(VirtualProcessRequest {
-                id,
-                payload,
-                response_sender,
-            })
-            .map_err(|_| anyhow!("virtual executable dispatcher is closed"))?;
+        let request_cancellation = CancellationSource::new();
+        let mut request = Some(VirtualProcessRequest {
+            id,
+            payload,
+            cancellation: request_cancellation.token(),
+            response_sender,
+        });
+        let deadline = wall_time.map(|timeout| Instant::now() + timeout);
 
-        let response = match wall_time {
-            Some(timeout) => response_receiver
-                .recv_timeout(timeout)
-                .map_err(|_| anyhow!("virtual executable exceeded wall time limit"))?,
-            None => response_receiver
-                .recv()
-                .map_err(|_| anyhow!("virtual executable response channel closed"))?,
-        };
-        Ok(response)
+        while let Some(candidate) = request.take() {
+            if cancellation.is_cancelled() {
+                request_cancellation.cancel();
+                return Err(anyhow!("process cancelled"));
+            }
+            if deadline.is_some_and(|time| Instant::now() >= time) {
+                request_cancellation.cancel();
+                return Err(anyhow!("virtual executable exceeded wall time limit"));
+            }
+
+            match self.inner.sender.try_send(candidate) {
+                Ok(()) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(candidate)) => {
+                    request = Some(candidate);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    request_cancellation.cancel();
+                    return Err(anyhow!("virtual executable dispatcher is closed"));
+                }
+            }
+        }
+
+        loop {
+            if cancellation.is_cancelled() {
+                request_cancellation.cancel();
+                return Err(anyhow!("process cancelled"));
+            }
+            if deadline.is_some_and(|time| Instant::now() >= time) {
+                request_cancellation.cancel();
+                return Err(anyhow!("virtual executable exceeded wall time limit"));
+            }
+
+            let wait_time = deadline.map_or(Duration::from_millis(10), |time| {
+                time.saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(10))
+            });
+            match response_receiver.recv_timeout(wait_time) {
+                Ok(response) => {
+                    request_cancellation.cancel();
+                    return Ok(response);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    request_cancellation.cancel();
+                    return Err(anyhow!("virtual executable response channel closed"));
+                }
+            }
+        }
     }
 }
 
@@ -702,14 +799,24 @@ impl VirtualExecutableRegistry {
             }))
     }
 
-    fn invoke_guest(&self, payload: &[u8], wall_time: Option<Duration>) -> Vec<u8> {
-        match self.invoke_guest_result(payload, wall_time) {
+    fn invoke_guest(
+        &self,
+        payload: &[u8],
+        wall_time: Option<Duration>,
+        cancellation: CancellationToken,
+    ) -> Vec<u8> {
+        match self.invoke_guest_result(payload, wall_time, cancellation) {
             Ok(response) => response,
             Err(error) => virtual_process_error_response(error.to_string()),
         }
     }
 
-    fn invoke_guest_result(&self, payload: &[u8], wall_time: Option<Duration>) -> Result<Vec<u8>> {
+    fn invoke_guest_result(
+        &self,
+        payload: &[u8],
+        wall_time: Option<Duration>,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<u8>> {
         let guest = parse_guest_virtual_process_payload(payload)
             .context("invalid virtual executable request")?;
         let executable_path = normalize_path(&guest.executable_path)?;
@@ -728,7 +835,8 @@ impl VirtualExecutableRegistry {
             stdin: guest.stdin,
         };
         let payload = serde_json::to_vec(&request)?;
-        self.bridge.invoke_blocking(payload, wall_time)
+        self.bridge
+            .invoke_blocking(payload, wall_time, cancellation)
     }
 }
 
@@ -787,11 +895,13 @@ impl VirtualExecutableFileSystem {
         inner: Arc<dyn FileSystem + Send + Sync>,
         registry: VirtualExecutableRegistry,
         wall_time: Option<Duration>,
+        cancellation: CancellationToken,
     ) -> Self {
         Self {
             inner,
             registry,
             wall_time,
+            cancellation,
         }
     }
 }
@@ -1292,6 +1402,7 @@ impl FileOpener for VirtualExecutableFileSystem {
             return Ok(Box::new(VirtualExecutableBridgeFile {
                 registry: self.registry.clone(),
                 wall_time: self.wall_time,
+                cancellation: self.cancellation.clone(),
                 request: Vec::new(),
                 response: None,
                 cursor: 0,
@@ -1313,7 +1424,9 @@ impl AsyncRead for VirtualExecutableBridgeFile {
     ) -> Poll<io::Result<()>> {
         if self.response.is_none() {
             let request = self.request.clone();
-            let response = self.registry.invoke_guest(&request, self.wall_time);
+            let response =
+                self.registry
+                    .invoke_guest(&request, self.wall_time, self.cancellation.clone());
             self.response = Some(response);
             self.cursor = 0;
         }
@@ -1672,8 +1785,12 @@ impl SandboxState {
         self.virtual_executables.unregister(&self.fs, token)
     }
 
-    pub fn run_blocking(&self, request: RunRequest) -> Result<CompletedProcess> {
-        self.catalog.run(self, request)
+    pub fn run_blocking(
+        &self,
+        request: RunRequest,
+        cancellation: CancellationToken,
+    ) -> Result<CompletedProcess> {
+        self.catalog.run(self, request, cancellation)
     }
 }
 
@@ -1723,7 +1840,12 @@ impl PackageCatalog {
         self.handle.block_on(future)
     }
 
-    fn run(&self, state: &SandboxState, request: RunRequest) -> Result<CompletedProcess> {
+    fn run(
+        &self,
+        state: &SandboxState,
+        request: RunRequest,
+        cancellation: CancellationToken,
+    ) -> Result<CompletedProcess> {
         if request.args.is_empty() {
             return Err(anyhow!("command arguments cannot be empty"));
         }
@@ -1744,7 +1866,16 @@ impl PackageCatalog {
         };
         let target = match self.resolve_command(state, &args[0], &cwd, env.get("PATH"))? {
             ResolvedCommand::Virtual(target) => {
-                return self.run_virtual_command(args, input, env, cwd, target, state, wall_time);
+                return self.run_virtual_command(
+                    args,
+                    input,
+                    env,
+                    cwd,
+                    target,
+                    state,
+                    wall_time,
+                    cancellation,
+                );
             }
             ResolvedCommand::Package(target) => target,
         };
@@ -1775,6 +1906,7 @@ impl PackageCatalog {
             state.events.clone(),
             state.virtual_executables.clone(),
             wall_time,
+            cancellation,
         );
 
         let stdout = stdout.capture("stdout")?;
@@ -1799,6 +1931,7 @@ impl PackageCatalog {
         target: ResolvedVirtualExecutable,
         state: &SandboxState,
         wall_time: Option<Duration>,
+        cancellation: CancellationToken,
     ) -> Result<CompletedProcess> {
         let cwd = cwd
             .to_str()
@@ -1813,10 +1946,11 @@ impl PackageCatalog {
             stdin: BASE64.encode(input),
         };
         let payload = serde_json::to_vec(&request)?;
-        let response = state
-            .virtual_executables
-            .bridge()
-            .invoke_blocking(payload, wall_time)?;
+        let response =
+            state
+                .virtual_executables
+                .bridge()
+                .invoke_blocking(payload, wall_time, cancellation)?;
         let response = decode_virtual_process_response(&response)
             .context("invalid virtual executable response")?;
         Ok(CompletedProcess {
@@ -1900,6 +2034,7 @@ impl PackageCatalog {
         events: EventBus,
         virtual_executables: VirtualExecutableRegistry,
         wall_time: Option<Duration>,
+        cancellation: CancellationToken,
     ) -> Result<i32> {
         let command = package
             .get_command(command_name)
@@ -1948,6 +2083,7 @@ impl PackageCatalog {
             events,
             virtual_executables,
             wall_time,
+            cancellation.clone(),
         ));
         builder.set_stdin(io.stdin);
         builder.set_stdout(io.stdout);
@@ -1961,6 +2097,7 @@ impl PackageCatalog {
         let command_name = command_name.to_string();
 
         let exit_code = tasks.spawn_and_block_on(async move {
+            let mut cancellation = cancellation;
             let run = async move {
                 let mut task_handle = spawn_exec(package, &command_name, env, &runtime)
                     .await
@@ -1972,18 +2109,29 @@ impl PackageCatalog {
                 Ok::<_, anyhow::Error>(exit_code)
             };
 
-            let exit_code = match wall_time {
-                Some(timeout) => match tokio::time::timeout(timeout, run).await {
-                    Ok(result) => result?,
-                    Err(_) => {
+            let exit_code = if let Some(timeout) = wall_time {
+                tokio::select! {
+                    result = run => result?,
+                    _ = tokio::time::sleep(timeout) => {
                         process.signal_process(Signal::Sigkill);
                         return Err(anyhow!(
                             "process exceeded wall time limit of {:.3} seconds",
                             timeout.as_secs_f64()
                         ));
                     }
-                },
-                None => run.await?,
+                    _ = cancellation.cancelled() => {
+                        process.signal_process(Signal::Sigkill);
+                        return Err(anyhow!("process cancelled"));
+                    }
+                }
+            } else {
+                tokio::select! {
+                    result = run => result?,
+                    _ = cancellation.cancelled() => {
+                        process.signal_process(Signal::Sigkill);
+                        return Err(anyhow!("process cancelled"));
+                    }
+                }
             };
             Ok::<_, anyhow::Error>(exit_code)
         })??;
@@ -2015,6 +2163,7 @@ fn process_filesystem(
     events: EventBus,
     virtual_executables: VirtualExecutableRegistry,
     wall_time: Option<Duration>,
+    cancellation: CancellationToken,
 ) -> Arc<dyn FileSystem + Send + Sync> {
     let filesystem: Arc<dyn FileSystem + Send + Sync> = match package_files {
         Some(files) => {
@@ -2027,6 +2176,7 @@ fn process_filesystem(
         filesystem,
         virtual_executables,
         wall_time,
+        cancellation,
     ));
     Arc::new(ObservableFileSystem::new(filesystem, events))
 }

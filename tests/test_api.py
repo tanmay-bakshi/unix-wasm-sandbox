@@ -300,6 +300,35 @@ async def test_event_subscription_close_stops_delivery() -> None:
 
 
 @pytest.mark.asyncio
+async def test_event_dispatcher_restart_keeps_notifications_enabled() -> None:
+    """Verify that stale event dispatchers cannot disable newer subscriptions."""
+    sandbox = Sandbox()
+    first_events: list[SandboxEvent] = []
+    second_events: list[SandboxEvent] = []
+    subscription = sandbox.on_event(first_events.append, path_prefix="/work/first.txt")
+    await asyncio.sleep(0)
+
+    subscription.close()
+    sandbox.on_event(second_events.append, path_prefix="/work/second.txt")
+    await sandbox.write_text("/work/second.txt", "visible")
+    await wait_for_events(second_events, 1)
+
+    assert first_events == []
+    assert [event.path for event in second_events] == ["/work/second.txt"]
+
+
+def test_failed_event_registration_does_not_leak_handler() -> None:
+    """Verify that event registration mutates state only after a loop is available."""
+    sandbox = Sandbox()
+    leaked_events: list[SandboxEvent] = []
+
+    with pytest.raises(RuntimeError, match="no running event loop"):
+        sandbox.on_event(leaked_events.append, path_prefix="/work/leaked.txt")
+
+    assert len(sandbox._event_handlers) == 0
+
+
+@pytest.mark.asyncio
 async def test_read_only_host_mount_exposes_live_host_files(tmp_path: Path) -> None:
     """Verify that read-only host mounts expose current host file contents."""
     host_file = tmp_path / "input.txt"
@@ -509,6 +538,121 @@ async def test_sandbox_python_subprocess_can_spawn_virtual_executable() -> None:
     assert result.stderr_text == "handler err\n"
     assert len(invocations) == 1
     assert invocations[0].argv == ("python-tool", "child")
+
+
+@pytest.mark.asyncio
+async def test_nested_virtual_executable_invocations_are_dispatched() -> None:
+    """Verify that virtual executable handlers can invoke other virtual executables."""
+    sandbox = Sandbox()
+
+    async def inner(invocation: CommandInvocation) -> CommandResult:
+        return CommandResult(stdout=f"inner:{invocation.argv[1]}\n".encode())
+
+    async def outer(invocation: CommandInvocation) -> CommandResult:
+        result = await invocation.run(["inner-tool", invocation.argv[1]], check=True)
+        return CommandResult(stdout=b"outer:" + result.stdout)
+
+    sandbox.register_executable(
+        "/usr/bin/inner-tool",
+        inner,
+        aliases=("/bin/inner-tool",),
+    )
+    sandbox.register_executable(
+        "/usr/bin/outer-tool",
+        outer,
+        aliases=("/bin/outer-tool",),
+    )
+
+    result = await sandbox.run(["outer-tool", "value"], check=True)
+
+    assert result.stdout_text == "outer:inner:value\n"
+
+
+@pytest.mark.asyncio
+async def test_virtual_executable_timeout_cancels_handler_side_effects() -> None:
+    """Verify that timed-out virtual executable handlers are cancelled."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=0.1)))
+    started = asyncio.Event()
+
+    async def handler(invocation: CommandInvocation) -> CommandResult:
+        started.set()
+        await asyncio.sleep(1.0)
+        await invocation.write_text("/work/late.txt", "late")
+        return CommandResult(stdout=b"late\n")
+
+    sandbox.register_executable(
+        "/usr/bin/slow-tool",
+        handler,
+        aliases=("/bin/slow-tool",),
+    )
+
+    with pytest.raises(SandboxError, match="wall time limit"):
+        await sandbox.run(["slow-tool"])
+
+    assert started.is_set() is True
+    await asyncio.sleep(0.2)
+    assert await sandbox.exists("/work/late.txt") is False
+
+
+@pytest.mark.asyncio
+async def test_closing_virtual_executables_completes_active_request() -> None:
+    """Verify that closing virtual executables unblocks active requests."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=None)))
+    started = asyncio.Event()
+
+    async def handler(invocation: CommandInvocation) -> CommandResult:
+        started.set()
+        await asyncio.sleep(10.0)
+        return CommandResult(stdout=b"late\n")
+
+    sandbox.register_executable(
+        "/usr/bin/slow-tool",
+        handler,
+        aliases=("/bin/slow-tool",),
+    )
+    task = asyncio.create_task(sandbox.run(["slow-tool"]))
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    sandbox.close_virtual_executables()
+    result = await asyncio.wait_for(task, timeout=2.0)
+
+    assert result.returncode == 126
+    assert result.stderr_text == "virtual executable request cancelled\n"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_run_stops_guest_process() -> None:
+    """Verify that cancelling a run task stops the underlying guest process."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=None)))
+    task = asyncio.create_task(
+        sandbox.run(
+            [
+                "python",
+                "-c",
+                (
+                    "from pathlib import Path\n"
+                    "import time\n"
+                    "Path('/work/started.txt').write_text('started')\n"
+                    "time.sleep(0.6)\n"
+                    "Path('/work/late.txt').write_text('late')\n"
+                ),
+            ],
+        ),
+    )
+
+    for _ in range(100):
+        started = await sandbox.exists("/work/started.txt")
+        if started is True:
+            break
+        await asyncio.sleep(0.05)
+
+    assert await sandbox.exists("/work/started.txt") is True
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(1.0)
+
+    assert await sandbox.exists("/work/late.txt") is False
 
 
 @pytest.mark.asyncio

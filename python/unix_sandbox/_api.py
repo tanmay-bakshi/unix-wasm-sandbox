@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import gzip
 import hashlib
 import json
@@ -454,9 +455,11 @@ class Sandbox:
     _native_sandbox: _native.Sandbox
     _event_handlers: dict[int, _EventHandlerRegistration]
     _event_dispatch_task: asyncio.Task[None] | None
+    _event_dispatch_generation: int
     _next_event_handler_token: int
     _virtual_executable_handlers: dict[int, VirtualExecutableHandler]
     _virtual_executable_dispatch_task: asyncio.Task[None] | None
+    _virtual_executable_request_tasks: dict[int, asyncio.Task[None]]
     _next_virtual_executable_token: int
 
     def __init__(self, config: SandboxConfig | None = None) -> None:
@@ -464,9 +467,11 @@ class Sandbox:
         self._config = config if config is not None else SandboxConfig()
         self._event_handlers = {}
         self._event_dispatch_task = None
+        self._event_dispatch_generation = 0
         self._next_event_handler_token = 0
         self._virtual_executable_handlers = {}
         self._virtual_executable_dispatch_task = None
+        self._virtual_executable_request_tasks = {}
         self._next_virtual_executable_token = 0
         files: dict[str, bytes | None] = {}
         for path, entry in self._config.files.items():
@@ -512,7 +517,7 @@ class Sandbox:
         :param exc_value: Exception value raised in the context.
         :param traceback: Traceback raised in the context.
         """
-        self.close_event_handlers()
+        self._shutdown_event_handlers()
         self.close_virtual_executables()
 
     def register_executable(
@@ -547,13 +552,7 @@ class Sandbox:
         for token in tokens:
             self._remove_virtual_executable(token)
 
-        task = self._virtual_executable_dispatch_task
-        self._virtual_executable_dispatch_task = None
-        if task is None:
-            return
-        if task.done():
-            return
-        task.cancel()
+        self._stop_virtual_executable_dispatcher()
 
     def _remove_virtual_executable(self, token: int) -> None:
         """:param token: Handler token to remove."""
@@ -564,6 +563,11 @@ class Sandbox:
             raise SandboxError(str(error)) from error
         if len(self._virtual_executable_handlers) > 0:
             return
+        self._stop_virtual_executable_dispatcher()
+
+    def _stop_virtual_executable_dispatcher(self) -> None:
+        """Stop virtual executable dispatch and active request tasks."""
+        self._cancel_virtual_executable_requests()
         task = self._virtual_executable_dispatch_task
         self._virtual_executable_dispatch_task = None
         if task is None:
@@ -584,18 +588,97 @@ class Sandbox:
             self._dispatch_virtual_processes()
         )
 
+    def _cancel_virtual_executable_requests(self) -> None:
+        """Cancel active virtual executable request tasks."""
+        for task in tuple(self._virtual_executable_request_tasks.values()):
+            if task.done():
+                continue
+            task.cancel()
+
     async def _dispatch_virtual_processes(self) -> None:
         """Deliver virtual executable invocations to registered handlers."""
         while len(self._virtual_executable_handlers) > 0:
             request_id, payload = await self._native_sandbox.next_virtual_process()
-            response = await self._handle_virtual_process(payload)
-            try:
-                self._native_sandbox.complete_virtual_process(request_id, response)
-            except RuntimeError:
-                LOGGER.error(
-                    "virtual executable response delivery failed\n%s",
-                    traceback.format_exc(),
-                )
+            self._start_virtual_process_request(request_id, payload)
+
+    def _start_virtual_process_request(self, request_id: int, payload: bytes) -> None:
+        """:param request_id: Native request identifier.
+        :param payload: Encoded invocation request.
+        """
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(self._complete_virtual_process_request(request_id, payload))
+        self._virtual_executable_request_tasks[request_id] = task
+        task.add_done_callback(
+            lambda completed: self._finish_virtual_process_request(request_id, completed)
+        )
+
+    def _finish_virtual_process_request(
+        self,
+        request_id: int,
+        task: asyncio.Task[None],
+    ) -> None:
+        """:param request_id: Native request identifier.
+        :param task: Completed request task.
+        """
+        self._virtual_executable_request_tasks.pop(request_id, None)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            LOGGER.error(
+                "virtual executable request supervisor failed\n%s",
+                traceback.format_exc(),
+            )
+
+    async def _complete_virtual_process_request(self, request_id: int, payload: bytes) -> None:
+        """:param request_id: Native request identifier.
+        :param payload: Encoded invocation request.
+        """
+        handler_task = asyncio.create_task(self._handle_virtual_process(payload))
+        cancellation_task = asyncio.ensure_future(
+            self._native_sandbox.wait_virtual_process_cancelled(request_id)
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {handler_task, cancellation_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancellation_task in done:
+                handler_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await handler_task
+                return
+
+            response = await handler_task
+            cancellation_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cancellation_task
+            self._complete_virtual_process(request_id, response)
+        except asyncio.CancelledError:
+            handler_task.cancel()
+            cancellation_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await handler_task
+            with contextlib.suppress(asyncio.CancelledError):
+                await cancellation_task
+            self._complete_virtual_process(
+                request_id,
+                _encode_virtual_executable_response(_virtual_handler_cancelled_result()),
+            )
+            raise
+
+    def _complete_virtual_process(self, request_id: int, response: bytes) -> None:
+        """:param request_id: Native request identifier.
+        :param response: Encoded invocation response.
+        """
+        try:
+            self._native_sandbox.complete_virtual_process(request_id, response)
+        except RuntimeError:
+            LOGGER.debug(
+                "virtual executable response delivery failed\n%s",
+                traceback.format_exc(),
+            )
 
     async def _handle_virtual_process(self, payload: bytes) -> bytes:
         """:param payload: Encoded invocation request.
@@ -642,6 +725,7 @@ class Sandbox:
         :raises RuntimeError: Raised when called outside a running asyncio loop.
         :raises ValueError: Raised when a filter value is invalid.
         """
+        loop = asyncio.get_running_loop()
         normalized_event_types = _normalize_event_types(event_types)
         normalized_path_prefix = _normalize_event_path_prefix(path_prefix)
         token = self._next_event_handler_token
@@ -651,13 +735,18 @@ class Sandbox:
             event_types=normalized_event_types,
             path_prefix=normalized_path_prefix,
         )
-        self._ensure_event_dispatcher()
+        self._ensure_event_dispatcher(loop)
         return EventSubscription(self, token)
 
     def close_event_handlers(self) -> None:
         """Remove all event handlers from the sandbox."""
         self._event_handlers.clear()
         self._native_sandbox.set_event_notifications_enabled(False)
+
+    def _shutdown_event_handlers(self) -> None:
+        """Remove event handlers and stop the dispatcher task."""
+        self.close_event_handlers()
+        self._event_dispatch_generation += 1
         task = self._event_dispatch_task
         self._event_dispatch_task = None
         if task is None:
@@ -673,18 +762,22 @@ class Sandbox:
             return
         self.close_event_handlers()
 
-    def _ensure_event_dispatcher(self) -> None:
+    def _ensure_event_dispatcher(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
         """:raises RuntimeError: Raised when no asyncio loop is running."""
         task = self._event_dispatch_task
         if task is not None and not task.done():
+            self._native_sandbox.set_event_notifications_enabled(True)
             return
-        loop = asyncio.get_running_loop()
+        if loop is None:
+            loop = asyncio.get_running_loop()
+        self._event_dispatch_generation += 1
+        generation = self._event_dispatch_generation
         self._native_sandbox.clear_events_now()
         self._native_sandbox.set_event_notifications_enabled(True)
-        self._event_dispatch_task = loop.create_task(self._dispatch_events())
+        self._event_dispatch_task = loop.create_task(self._dispatch_events(generation))
 
-    async def _dispatch_events(self) -> None:
-        """Deliver native filesystem events to registered handlers."""
+    async def _dispatch_events(self, generation: int) -> None:
+        """:param generation: Dispatcher generation owned by this task."""
         try:
             while len(self._event_handlers) > 0:
                 native_event = await self._native_sandbox.next_event()
@@ -693,7 +786,8 @@ class Sandbox:
                     if _event_matches(registration, event):
                         await _call_event_handler(registration.handler, event)
         finally:
-            self._native_sandbox.set_event_notifications_enabled(False)
+            if self._event_dispatch_generation == generation:
+                self._native_sandbox.set_event_notifications_enabled(False)
 
     async def run(
         self,
@@ -903,6 +997,11 @@ def _virtual_handler_error_result(formatted: str, limit: int) -> CommandResult:
     if len(stderr) <= limit:
         return CommandResult(returncode=1, stderr=stderr)
     return CommandResult(returncode=1, stderr=stderr[:limit])
+
+
+def _virtual_handler_cancelled_result() -> CommandResult:
+    """:returns: Error result for a cancelled virtual executable handler."""
+    return CommandResult(returncode=126, stderr=b"virtual executable request cancelled\n")
 
 
 def _combine_virtual_output(stream: VirtualProcessOutput, data: bytes) -> bytes:
