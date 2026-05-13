@@ -467,6 +467,7 @@ class Sandbox:
     _virtual_executable_dispatch_task: asyncio.Task[None] | None
     _virtual_executable_request_tasks: dict[int, asyncio.Task[None]]
     _next_virtual_executable_token: int
+    _next_process_token: int
 
     def __init__(self, config: SandboxConfig | None = None) -> None:
         """:param config: Sandbox configuration."""
@@ -479,6 +480,7 @@ class Sandbox:
         self._virtual_executable_dispatch_task = None
         self._virtual_executable_request_tasks = {}
         self._next_virtual_executable_token = 0
+        self._next_process_token = 0
         files: dict[str, bytes | None] = {}
         for path, entry in self._config.files.items():
             if isinstance(entry, File):
@@ -890,8 +892,19 @@ class Sandbox:
         """
         input_bytes = input.encode() if isinstance(input, str) else input
         self._ensure_virtual_executable_dispatcher()
+        process_token = self._next_process_token
+        self._next_process_token += 1
         try:
-            native_result = await self._native_sandbox.run(list(args), input_bytes, env, cwd)
+            native_result = await self._native_sandbox.run(
+                process_token,
+                list(args),
+                input_bytes,
+                env,
+                cwd,
+            )
+        except asyncio.CancelledError:
+            self._native_sandbox.cancel_process(process_token)
+            raise
         except RuntimeError as error:
             raise SandboxError(str(error)) from error
         result = CompletedProcess(

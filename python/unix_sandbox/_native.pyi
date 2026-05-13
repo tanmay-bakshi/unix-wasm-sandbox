@@ -43,6 +43,8 @@ class Sandbox:
 
     def wait_virtual_process_cancelled(self, id: int) -> Awaitable[None]: ...
 
+    def cancel_process(self, id: int) -> None: ...
+
     def exists(self, path: str) -> Awaitable[bool]: ...
 
     def read_file(self, path: str) -> Awaitable[bytes]: ...
@@ -53,6 +55,7 @@ class Sandbox:
 
     def run(
         self,
+        id: int,
         args: list[str],
         input: bytes | None,
         env: dict[str, str] | None,

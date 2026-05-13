@@ -651,6 +651,17 @@ async def test_closing_virtual_executables_completes_active_request() -> None:
 async def test_cancelled_run_stops_guest_process() -> None:
     """Verify that cancelling a run task stops the underlying guest process."""
     sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=None)))
+    started = asyncio.Event()
+
+    async def marker(invocation: CommandInvocation) -> CommandResult:
+        started.set()
+        return CommandResult()
+
+    sandbox.register_executable(
+        "/usr/bin/start-tool",
+        marker,
+        aliases=("/bin/start-tool",),
+    )
     task = asyncio.create_task(
         sandbox.run(
             [
@@ -658,26 +669,21 @@ async def test_cancelled_run_stops_guest_process() -> None:
                 "-c",
                 (
                     "from pathlib import Path\n"
+                    "import subprocess\n"
                     "import time\n"
-                    "Path('/work/started.txt').write_text('started')\n"
-                    "time.sleep(0.6)\n"
+                    "subprocess.run(['start-tool'], check=True)\n"
+                    "time.sleep(2)\n"
                     "Path('/work/late.txt').write_text('late')\n"
                 ),
             ],
         ),
     )
 
-    for _ in range(100):
-        started = await sandbox.exists("/work/started.txt")
-        if started is True:
-            break
-        await asyncio.sleep(0.05)
-
-    assert await sandbox.exists("/work/started.txt") is True
+    await asyncio.wait_for(started.wait(), timeout=60.0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(2.5)
 
     assert await sandbox.exists("/work/late.txt") is False
 

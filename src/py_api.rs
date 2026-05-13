@@ -33,28 +33,44 @@ impl From<CoreCompletedProcess> for CompletedProcess {
     }
 }
 
-struct CancellationGuard {
-    source: Option<CancellationSource>,
+struct RunningProcessGuard {
+    id: u64,
+    processes: Arc<Mutex<HashMap<u64, CancellationSource>>>,
+    active: bool,
 }
 
-impl CancellationGuard {
-    fn new(source: CancellationSource) -> Self {
-        Self {
-            source: Some(source),
-        }
+impl RunningProcessGuard {
+    fn new(
+        id: u64,
+        processes: Arc<Mutex<HashMap<u64, CancellationSource>>>,
+        source: CancellationSource,
+    ) -> PyResult<Self> {
+        processes
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("process cancellation lock failed"))?
+            .insert(id, source);
+        Ok(Self {
+            id,
+            processes,
+            active: true,
+        })
     }
 
-    fn disarm(&mut self) {
-        self.source = None;
-    }
-}
-
-impl Drop for CancellationGuard {
-    fn drop(&mut self) {
-        let Some(source) = self.source.take() else {
+    fn finish(&mut self) {
+        let Ok(mut processes) = self.processes.lock() else {
             return;
         };
-        source.cancel();
+        processes.remove(&self.id);
+        self.active = false;
+    }
+}
+
+impl Drop for RunningProcessGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        };
+        cancel_process(&self.processes, self.id);
     }
 }
 
@@ -66,6 +82,7 @@ pub struct Sandbox {
     virtual_process_receiver:
         Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<VirtualProcessRequest>>>,
     pending_virtual_processes: Arc<Mutex<HashMap<u64, VirtualProcessRequest>>>,
+    running_processes: Arc<Mutex<HashMap<u64, CancellationSource>>>,
 }
 
 #[pymethods]
@@ -112,6 +129,7 @@ impl Sandbox {
             event_receiver: Arc::new(tokio::sync::Mutex::new(event_receiver)),
             virtual_process_receiver: Arc::new(tokio::sync::Mutex::new(virtual_process_receiver)),
             pending_virtual_processes: Arc::new(Mutex::new(HashMap::new())),
+            running_processes: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -223,6 +241,10 @@ impl Sandbox {
         })
     }
 
+    fn cancel_process(&self, id: u64) {
+        cancel_process(&self.running_processes, id);
+    }
+
     fn exists<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let state = self.state.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -273,6 +295,7 @@ impl Sandbox {
     fn run<'py>(
         &self,
         py: Python<'py>,
+        id: u64,
         args: Vec<String>,
         input: Option<Vec<u8>>,
         env: Option<HashMap<String, String>>,
@@ -281,9 +304,10 @@ impl Sandbox {
         let state = self.state.clone();
         let cancellation_source = CancellationSource::new();
         let cancellation = cancellation_source.token();
-        let cancellation_guard = CancellationGuard::new(cancellation_source);
+        let process_guard =
+            RunningProcessGuard::new(id, self.running_processes.clone(), cancellation_source)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut cancellation_guard = cancellation_guard;
+            let mut process_guard = process_guard;
             let state = state
                 .lock()
                 .map_err(|_| PyRuntimeError::new_err("sandbox state lock failed"))?
@@ -301,7 +325,7 @@ impl Sandbox {
             })
             .await
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-            cancellation_guard.disarm();
+            process_guard.finish();
             let process = process.map_err(py_error)?;
 
             Ok(CompletedProcess::from(process))
@@ -322,4 +346,14 @@ fn py_error(error: anyhow::Error) -> PyErr {
         .collect::<Vec<_>>()
         .join(": ");
     PyRuntimeError::new_err(message)
+}
+
+fn cancel_process(processes: &Arc<Mutex<HashMap<u64, CancellationSource>>>, id: u64) {
+    let Ok(mut processes) = processes.lock() else {
+        return;
+    };
+    let Some(source) = processes.remove(&id) else {
+        return;
+    };
+    source.cancel();
 }
