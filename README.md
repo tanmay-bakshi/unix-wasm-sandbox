@@ -123,9 +123,10 @@ text = await sandbox.check_output_text(["python", "-c", "print('ok')"])
 ```
 
 Sandbox filesystem events can be delivered to synchronous or async handlers.
-Handlers run on the asyncio event loop where they are registered, while Wasmer
-process execution only enqueues bounded event data and does not wait for Python
-callbacks.
+Handlers run on the asyncio event loop where they are registered. Wasmer process
+execution only enqueues bounded event data and does not wait for Python
+callbacks; each subscription drains through its own bounded delivery queue, so a
+slow handler does not block unrelated subscriptions.
 
 ```python
 from unix_sandbox import SandboxEvent, SandboxEventKind
@@ -145,7 +146,7 @@ await sandbox.run(["bash", "-lc", "printf data > /work/output.txt"], check=True)
 subscription.close()
 ```
 
-If handlers fall behind, the queue stays bounded and the stream emits an
+If handlers fall behind, queues stay bounded and the stream emits a
 `SandboxEventKind.EVENTS_DROPPED` event with `dropped_count` set. Events are
 reported for filesystem operations performed through the sandbox; external host
 changes made behind a live host mount are visible through the mount but do not
@@ -180,11 +181,12 @@ registration.close()
 
 Handlers receive the owning sandbox, argv, cwd, environment, direct invocation
 stdin, and bounded stdout/stderr streams. They may return `None`, an integer
-return code, `CommandResult`, or `CompletedProcess`. Handler code runs in the
-host process and is intentionally a trusted integration point; sandbox isolation
-applies to the Wasmer guest, not to arbitrary Python handler code. Nested guest
-invocations are conservative about inherited stdin and do not drain the parent
-process descriptor automatically.
+return code, `CommandResult`, or `CompletedProcess`. Virtual executable requests
+are supervised independently, so handlers may invoke other sandbox commands,
+including other virtual executables. Handler code runs in the host process and is
+intentionally a trusted integration point; sandbox isolation applies to the
+Wasmer guest, not to arbitrary Python handler code. Timed-out or cancelled guest
+runs cancel their active virtual executable requests cooperatively.
 
 Commands can be invoked by name through the sandbox `PATH`, or through the
 standard `/bin/<name>` and `/usr/bin/<name>` mappings. Path-like executable
