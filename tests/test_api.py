@@ -317,6 +317,33 @@ async def test_event_dispatcher_restart_keeps_notifications_enabled() -> None:
     assert [event.path for event in second_events] == ["/work/second.txt"]
 
 
+@pytest.mark.asyncio
+async def test_slow_event_handler_does_not_block_other_handlers() -> None:
+    """Verify that event handlers are delivered independently."""
+    sandbox = Sandbox()
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
+    fast_events: list[SandboxEvent] = []
+
+    async def slow_handler(event: SandboxEvent) -> None:
+        slow_started.set()
+        await release_slow.wait()
+
+    sandbox.on_event(slow_handler, path_prefix="/work")
+    sandbox.on_event(fast_events.append, path_prefix="/work")
+
+    await sandbox.write_text("/work/first.txt", "first")
+    await asyncio.wait_for(slow_started.wait(), timeout=2.0)
+    await sandbox.write_text("/work/second.txt", "second")
+    await wait_for_events(fast_events, 2)
+    release_slow.set()
+
+    assert [event.path for event in fast_events] == [
+        "/work/first.txt",
+        "/work/second.txt",
+    ]
+
+
 def test_failed_event_registration_does_not_leak_handler() -> None:
     """Verify that event registration mutates state only after a loop is available."""
     sandbox = Sandbox()

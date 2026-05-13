@@ -137,18 +137,24 @@ class SandboxEvent:
 FilesystemEventHandler = Callable[[SandboxEvent], Awaitable[None] | None]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _EventHandlerRegistration:
     """A registered event handler and its delivery filter.
 
     :ivar handler: Handler to invoke for matching events.
     :ivar event_types: Event kinds to deliver.
     :ivar path_prefix: Sandbox path prefix to deliver.
+    :ivar queue: Pending events for this handler.
+    :ivar worker_task: Task delivering queued events to the handler.
+    :ivar dropped_count: Number of queued events dropped due to handler backpressure.
     """
 
     handler: FilesystemEventHandler
     event_types: frozenset[SandboxEventKind] | None
     path_prefix: str | None
+    queue: asyncio.Queue[SandboxEvent]
+    worker_task: asyncio.Task[None]
+    dropped_count: int = 0
 
 
 class EventSubscription:
@@ -730,16 +736,27 @@ class Sandbox:
         normalized_path_prefix = _normalize_event_path_prefix(path_prefix)
         token = self._next_event_handler_token
         self._next_event_handler_token += 1
+        queue: asyncio.Queue[SandboxEvent] = asyncio.Queue(
+            maxsize=self._config.event_queue_size,
+        )
+        worker_task = loop.create_task(self._deliver_events(handler, queue))
         self._event_handlers[token] = _EventHandlerRegistration(
             handler=handler,
             event_types=normalized_event_types,
             path_prefix=normalized_path_prefix,
+            queue=queue,
+            worker_task=worker_task,
+        )
+        worker_task.add_done_callback(
+            lambda completed: self._finish_event_delivery(token, completed)
         )
         self._ensure_event_dispatcher(loop)
         return EventSubscription(self, token)
 
     def close_event_handlers(self) -> None:
         """Remove all event handlers from the sandbox."""
+        for registration in tuple(self._event_handlers.values()):
+            self._stop_event_delivery(registration)
         self._event_handlers.clear()
         self._native_sandbox.set_event_notifications_enabled(False)
 
@@ -757,7 +774,9 @@ class Sandbox:
 
     def _remove_event_subscription(self, token: int) -> None:
         """:param token: Handler token to remove."""
-        self._event_handlers.pop(token, None)
+        registration = self._event_handlers.pop(token, None)
+        if registration is not None:
+            self._stop_event_delivery(registration)
         if len(self._event_handlers) > 0:
             return
         self.close_event_handlers()
@@ -784,10 +803,73 @@ class Sandbox:
                 event = SandboxEvent._from_native(native_event)
                 for registration in tuple(self._event_handlers.values()):
                     if _event_matches(registration, event):
-                        await _call_event_handler(registration.handler, event)
+                        self._queue_event_delivery(registration, event)
         finally:
             if self._event_dispatch_generation == generation:
                 self._native_sandbox.set_event_notifications_enabled(False)
+
+    async def _deliver_events(
+        self,
+        handler: FilesystemEventHandler,
+        queue: asyncio.Queue[SandboxEvent],
+    ) -> None:
+        """:param handler: Handler to invoke.
+        :param queue: Event queue for the handler.
+        """
+        while True:
+            event = await queue.get()
+            await _call_event_handler(handler, event)
+
+    def _finish_event_delivery(
+        self,
+        token: int,
+        task: asyncio.Task[None],
+    ) -> None:
+        """:param token: Handler token.
+        :param task: Completed delivery task.
+        """
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            self._event_handlers.pop(token, None)
+            if len(self._event_handlers) == 0:
+                self.close_event_handlers()
+            LOGGER.error(
+                "sandbox event delivery task failed\n%s",
+                traceback.format_exc(),
+            )
+
+    def _stop_event_delivery(self, registration: _EventHandlerRegistration) -> None:
+        """:param registration: Handler registration to stop."""
+        if registration.worker_task.done():
+            return
+        registration.worker_task.cancel()
+
+    def _queue_event_delivery(
+        self,
+        registration: _EventHandlerRegistration,
+        event: SandboxEvent,
+    ) -> None:
+        """:param registration: Handler registration to receive the event.
+        :param event: Event to enqueue.
+        """
+        if registration.dropped_count > 0:
+            dropped_event = SandboxEvent(
+                sequence=event.sequence,
+                kind=SandboxEventKind.EVENTS_DROPPED,
+                path="/",
+                dropped_count=registration.dropped_count,
+            )
+            if not _queue_event_nowait(registration, dropped_event):
+                registration.dropped_count += 1
+                return
+            registration.dropped_count = 0
+
+        if _queue_event_nowait(registration, event):
+            return
+        registration.dropped_count += 1
 
     async def run(
         self,
@@ -1082,6 +1164,21 @@ def _event_matches(registration: _EventHandlerRegistration, event: SandboxEvent)
     if event.target_path is None:
         return False
     return _path_matches_prefix(event.target_path, registration.path_prefix)
+
+
+def _queue_event_nowait(
+    registration: _EventHandlerRegistration,
+    event: SandboxEvent,
+) -> bool:
+    """:param registration: Handler registration.
+    :param event: Event to enqueue.
+    :returns: Whether the event was queued.
+    """
+    try:
+        registration.queue.put_nowait(event)
+    except asyncio.QueueFull:
+        return False
+    return True
 
 
 def _path_matches_prefix(path: str, prefix: str) -> bool:
