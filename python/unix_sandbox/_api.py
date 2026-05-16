@@ -12,6 +12,7 @@ import os
 import struct
 import tempfile
 import traceback
+import urllib.request
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -26,6 +27,16 @@ from . import _native
 DEFAULT_WALL_TIME_SECONDS = 30.0
 DEFAULT_EVENT_QUEUE_SIZE = 4096
 LOGGER = logging.getLogger(__name__)
+STANDARD_PACKAGE_NAMES = (
+    "coreutils",
+    "bash",
+    "grep",
+    "sed",
+    "find",
+    "tar",
+    "gzip",
+    "python",
+)
 
 
 class SandboxError(RuntimeError):
@@ -87,6 +98,218 @@ class HostMount:
     def _native_tuple(self) -> tuple[str, str, bool]:
         """:returns: Native mount configuration tuple."""
         return (str(Path(self.source).expanduser()), self.target, self.read_only)
+
+
+class PackageSource(StrEnum):
+    """Sources from which a Wasmer package can be loaded."""
+
+    BUNDLED = "bundled"
+    LOCAL = "local"
+    URL = "url"
+
+
+@dataclass(frozen=True, slots=True)
+class PackageCommandAlias:
+    """An additional command name exposed for a package command.
+
+    :ivar alias: Command name to expose on the sandbox PATH.
+    :ivar command: Package command that should run when the alias is invoked.
+    """
+
+    alias: str
+    command: str
+
+    def __post_init__(self) -> None:
+        """:raises ValueError: Raised when a command name is invalid."""
+        _validate_package_command_name(self.alias, "alias")
+        _validate_package_command_name(self.command, "command")
+
+
+PackageCommandAliasInput = PackageCommandAlias | tuple[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class WasmerPackage:
+    """A Wasmer WEBC package available inside a sandbox image.
+
+    :ivar name: Logical package name used by the sandbox image.
+    :ivar source: Package source kind.
+    :ivar path: Local WEBC path for local packages.
+    :ivar url: WEBC URL for downloaded packages.
+    :ivar sha256: Expected expanded WEBC SHA-256 digest.
+    :ivar command_aliases: Additional command aliases exposed on PATH.
+    """
+
+    name: str
+    source: PackageSource
+    path: str | Path | None = None
+    url: str | None = None
+    sha256: str | None = None
+    command_aliases: tuple[PackageCommandAlias, ...] = ()
+
+    def __post_init__(self) -> None:
+        """:raises ValueError: Raised when the package configuration is invalid."""
+        if len(self.name) == 0:
+            raise ValueError("package name cannot be empty")
+        if "\0" in self.name:
+            raise ValueError("package name cannot contain NUL bytes")
+
+        source = PackageSource(self.source)
+        object.__setattr__(self, "source", source)
+        object.__setattr__(
+            self,
+            "command_aliases",
+            _normalize_package_command_aliases(self.command_aliases),
+        )
+
+        if self.sha256 is not None:
+            _validate_sha256(self.sha256, "package sha256")
+
+        if source is PackageSource.BUNDLED:
+            if self.path is not None or self.url is not None:
+                raise ValueError("bundled packages cannot define path or url")
+            return
+
+        if source is PackageSource.LOCAL:
+            if self.path is None:
+                raise ValueError("local packages require a path")
+            if self.url is not None:
+                raise ValueError("local packages cannot define url")
+            return
+
+        if self.url is None:
+            raise ValueError("url packages require a url")
+        if self.path is not None:
+            raise ValueError("url packages cannot define path")
+        if self.sha256 is None:
+            raise ValueError("url packages require sha256")
+
+    @classmethod
+    def bundled(
+        cls,
+        name: str,
+        *,
+        command_aliases: Iterable[PackageCommandAliasInput] = (),
+    ) -> Self:
+        """:param name: Bundled package name.
+        :param command_aliases: Additional command aliases exposed on PATH.
+        :returns: Package loaded from the package's bundled assets.
+        """
+        return cls(
+            name=name,
+            source=PackageSource.BUNDLED,
+            command_aliases=_normalize_package_command_aliases(command_aliases),
+        )
+
+    @classmethod
+    def local_webc(
+        cls,
+        name: str,
+        path: str | Path,
+        *,
+        sha256: str | None = None,
+        command_aliases: Iterable[PackageCommandAliasInput] = (),
+    ) -> Self:
+        """:param name: Logical package name.
+        :param path: Local WEBC path.
+        :param sha256: Expected WEBC SHA-256 digest.
+        :param command_aliases: Additional command aliases exposed on PATH.
+        :returns: Package loaded from a local WEBC file.
+        """
+        return cls(
+            name=name,
+            source=PackageSource.LOCAL,
+            path=path,
+            sha256=sha256,
+            command_aliases=_normalize_package_command_aliases(command_aliases),
+        )
+
+    @classmethod
+    def url_webc(
+        cls,
+        name: str,
+        url: str,
+        *,
+        sha256: str,
+        command_aliases: Iterable[PackageCommandAliasInput] = (),
+    ) -> Self:
+        """:param name: Logical package name.
+        :param url: URL for a WEBC package.
+        :param sha256: Expected WEBC SHA-256 digest.
+        :param command_aliases: Additional command aliases exposed on PATH.
+        :returns: Package downloaded from a URL-backed WEBC file.
+        """
+        return cls(
+            name=name,
+            source=PackageSource.URL,
+            url=url,
+            sha256=sha256,
+            command_aliases=_normalize_package_command_aliases(command_aliases),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxImage:
+    """Composable package image used to create sandbox process environments.
+
+    :ivar packages: Ordered Wasmer packages available in the image.
+    """
+
+    packages: tuple[WasmerPackage, ...] = ()
+
+    def __post_init__(self) -> None:
+        """:raises ValueError: Raised when package names are duplicated."""
+        packages = tuple(self.packages)
+        names: set[str] = set()
+        for package in packages:
+            if package.name in names:
+                raise ValueError(f"package name configured more than once: {package.name}")
+            names.add(package.name)
+        object.__setattr__(self, "packages", packages)
+
+    @classmethod
+    def standard(cls) -> Self:
+        """:returns: Standard UNIX-like image bundled with this package."""
+        return cls(
+            tuple(
+                WasmerPackage.bundled(
+                    name,
+                    command_aliases=(
+                        (PackageCommandAlias("python3", "python"),)
+                        if name == "python"
+                        else ()
+                    ),
+                )
+                for name in STANDARD_PACKAGE_NAMES
+            )
+        )
+
+    @classmethod
+    def empty(cls) -> Self:
+        """:returns: Empty image with no Wasmer packages."""
+        return cls()
+
+    @classmethod
+    def from_packages(cls, packages: Iterable[WasmerPackage]) -> Self:
+        """:param packages: Packages to include.
+        :returns: Image containing the supplied packages.
+        """
+        return cls(tuple(packages))
+
+    def with_packages(self, *packages: WasmerPackage) -> Self:
+        """:param packages: Packages to append to the image.
+        :returns: Image with the supplied packages appended.
+        """
+        return type(self)((*self.packages, *packages))
+
+    def without(self, *names: str) -> Self:
+        """:param names: Package names to remove.
+        :returns: Image without packages matching the supplied names.
+        """
+        removed = frozenset(names)
+        return type(self)(
+            tuple(package for package in self.packages if package.name not in removed)
+        )
 
 
 class SandboxEventKind(StrEnum):
@@ -430,6 +653,7 @@ class Limits:
 class SandboxConfig:
     """Configuration for a sandbox instance.
 
+    :ivar image: Package image that defines available Wasmer commands.
     :ivar files: Filesystem entries to create before commands run.
     :ivar host_mounts: Live host directory mounts to expose inside the sandbox.
     :ivar virtual_executables: Host-backed executables to expose inside the sandbox.
@@ -439,6 +663,7 @@ class SandboxConfig:
     :ivar event_queue_size: Maximum queued filesystem events before overflow.
     """
 
+    image: SandboxImage = field(default_factory=SandboxImage.standard)
     files: dict[str, File | Directory] = field(default_factory=dict)
     host_mounts: list[HostMount] = field(default_factory=list)
     virtual_executables: list[VirtualExecutable] = field(default_factory=list)
@@ -488,14 +713,14 @@ class Sandbox:
                 continue
             files[path] = None
 
-        asset_dir = _prepare_asset_dir()
+        packages = _prepare_image_packages(self._config.image)
         try:
             self._native_sandbox = _native.Sandbox(
                 files,
                 [mount._native_tuple() for mount in self._config.host_mounts],
+                packages,
                 self._config.cwd,
                 self._config.env,
-                str(asset_dir),
                 self._config.limits.output_bytes,
                 self._config.limits.wall_time_seconds,
                 self._config.event_queue_size,
@@ -1007,6 +1232,51 @@ class Sandbox:
             raise SandboxError(str(error)) from error
 
 
+def _normalize_package_command_aliases(
+    aliases: Iterable[PackageCommandAliasInput],
+) -> tuple[PackageCommandAlias, ...]:
+    """:param aliases: Alias values to normalize.
+    :returns: Normalized package command aliases.
+    :raises ValueError: Raised when alias values are invalid.
+    """
+    normalized: list[PackageCommandAlias] = []
+    for alias in aliases:
+        if isinstance(alias, PackageCommandAlias):
+            normalized_alias = alias
+        else:
+            alias_name, command = alias
+            normalized_alias = PackageCommandAlias(alias_name, command)
+        if normalized_alias in normalized:
+            continue
+        normalized.append(normalized_alias)
+    return tuple(normalized)
+
+
+def _validate_package_command_name(value: str, label: str) -> None:
+    """:param value: Command name to validate.
+    :param label: Name used in validation errors.
+    :raises ValueError: Raised when the command name is invalid.
+    """
+    if len(value) == 0:
+        raise ValueError(f"package command {label} cannot be empty")
+    if "\0" in value:
+        raise ValueError(f"package command {label} cannot contain NUL bytes")
+    if "/" in value:
+        raise ValueError(f"package command {label} cannot contain path separators")
+
+
+def _validate_sha256(value: str, label: str) -> None:
+    """:param value: SHA-256 digest to validate.
+    :param label: Name used in validation errors.
+    :raises ValueError: Raised when the digest is invalid.
+    """
+    if len(value) != 64:
+        raise ValueError(f"{label} must contain 64 hexadecimal characters")
+    if all(character in "0123456789abcdefABCDEF" for character in value):
+        return
+    raise ValueError(f"{label} must contain 64 hexadecimal characters")
+
+
 def _normalize_virtual_executable_paths(path: str, aliases: Iterable[str]) -> list[str]:
     """:param path: Primary executable path.
     :param aliases: Additional executable paths.
@@ -1217,18 +1487,184 @@ async def _call_event_handler(handler: FilesystemEventHandler, event: SandboxEve
         LOGGER.error("sandbox event handler failed\n%s", traceback.format_exc())
 
 
-def _prepare_asset_dir() -> Path:
-    """:returns: Directory containing expanded WEBC assets."""
+NativePackageSpec = tuple[str, str, str, list[tuple[str, str]]]
+
+
+def _prepare_image_packages(image: SandboxImage) -> list[NativePackageSpec]:
+    """:param image: Sandbox package image.
+    :returns: Native package specifications.
+    """
     source_dir = resources.files("unix_sandbox").joinpath("assets")
     manifest = _load_asset_manifest(source_dir)
     cache_dir = _asset_cache_dir(manifest)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    for name in manifest:
-        spec = manifest[name]
-        _expand_asset(source_dir, cache_dir, name, spec["sha256"])
+    packages: list[NativePackageSpec] = []
+    for package in image.packages:
+        if package.source is PackageSource.BUNDLED:
+            packages.append(_prepare_bundled_package(package, source_dir, manifest, cache_dir))
+            continue
+        if package.source is PackageSource.LOCAL:
+            packages.append(_prepare_local_package(package))
+            continue
+        packages.append(_prepare_url_package(package))
 
-    return cache_dir
+    return packages
+
+
+def _prepare_bundled_package(
+    package: WasmerPackage,
+    source_dir: Traversable,
+    manifest: dict[str, dict[str, str]],
+    cache_dir: Path,
+) -> NativePackageSpec:
+    """:param package: Bundled package to prepare.
+    :param source_dir: Package asset directory.
+    :param manifest: Bundled asset manifest.
+    :param cache_dir: Cache directory for expanded assets.
+    :returns: Native package specification.
+    :raises SandboxError: Raised when the bundled package does not exist.
+    """
+    spec = manifest.get(package.name)
+    if spec is None:
+        raise SandboxError(f"bundled package not found: {package.name}")
+
+    sha256 = spec["sha256"]
+    _expand_asset(source_dir, cache_dir, package.name, sha256)
+    return _native_package_spec(
+        package,
+        cache_dir / f"{package.name}.webc",
+        sha256,
+    )
+
+
+def _prepare_local_package(package: WasmerPackage) -> NativePackageSpec:
+    """:param package: Local package to prepare.
+    :returns: Native package specification.
+    :raises SandboxError: Raised when the local package cannot be used.
+    """
+    if package.path is None:
+        raise SandboxError(f"local package {package.name} requires a path")
+
+    path = Path(package.path).expanduser()
+    if not path.exists():
+        raise SandboxError(f"package {package.name} path does not exist: {path}")
+    if not path.is_file():
+        raise SandboxError(f"package {package.name} path is not a file: {path}")
+
+    sha256 = _hash_file(path)
+    if package.sha256 is not None and sha256 != package.sha256:
+        raise SandboxError(
+            f"{package.name} package hash mismatch: expected {package.sha256}, got {sha256}"
+        )
+
+    return _native_package_spec(package, path.resolve(), sha256)
+
+
+def _prepare_url_package(package: WasmerPackage) -> NativePackageSpec:
+    """:param package: URL-backed package to prepare.
+    :returns: Native package specification.
+    :raises SandboxError: Raised when the downloaded package hash does not match.
+    """
+    if package.url is None:
+        raise SandboxError(f"url package {package.name} requires a url")
+    if package.sha256 is None:
+        raise SandboxError(f"url package {package.name} requires sha256")
+
+    cache_dir = _package_cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"{package.sha256}.webc"
+    marker = cache_dir / f"{package.sha256}.webc.sha256"
+    if (
+        path.exists()
+        and marker.exists()
+        and marker.read_bytes().strip() == package.sha256.encode()
+    ):
+        return _native_package_spec(package, path, package.sha256)
+
+    temporary: Path | None = None
+    completed = False
+    digest = hashlib.sha256()
+    try:
+        request = urllib.request.Request(
+            package.url,
+            headers={"User-Agent": "unix-wasm-sandbox package fetcher"},
+        )
+        with (
+            urllib.request.urlopen(request, timeout=120) as response,
+            tempfile.NamedTemporaryFile(
+                "wb",
+                dir=cache_dir,
+                prefix=f"{package.name}.",
+                suffix=".webc.tmp",
+                delete=False,
+            ) as output,
+        ):
+            temporary = Path(output.name)
+            while True:
+                chunk = response.read(1024 * 1024)
+                if len(chunk) == 0:
+                    break
+                digest.update(chunk)
+                output.write(chunk)
+
+        actual_sha256 = digest.hexdigest()
+        if actual_sha256 != package.sha256:
+            raise SandboxError(
+                f"{package.name} package hash mismatch: "
+                f"expected {package.sha256}, got {actual_sha256}"
+            )
+
+        temporary.replace(path)
+        marker.write_text(package.sha256 + "\n", encoding="utf-8")
+        completed = True
+    finally:
+        if not completed and temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+    return _native_package_spec(package, path, package.sha256)
+
+
+def _native_package_spec(
+    package: WasmerPackage,
+    path: Path,
+    sha256: str,
+) -> NativePackageSpec:
+    """:param package: Package configuration.
+    :param path: Expanded WEBC path.
+    :param sha256: Expanded WEBC SHA-256 digest.
+    :returns: Native package specification.
+    """
+    return (
+        package.name,
+        str(path),
+        sha256,
+        [(alias.alias, alias.command) for alias in package.command_aliases],
+    )
+
+
+def _package_cache_dir() -> Path:
+    """:returns: Cache directory for URL-backed WEBC packages."""
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    if cache_home is not None and len(cache_home) > 0:
+        root = Path(cache_home)
+    else:
+        root = Path.home() / ".cache"
+    return root / "unix-wasm-sandbox" / "packages"
+
+
+def _hash_file(path: Path) -> str:
+    """:param path: File to hash.
+    :returns: SHA-256 digest for the file contents.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while True:
+            chunk = file.read(1024 * 1024)
+            if len(chunk) == 0:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _load_asset_manifest(source_dir: Traversable) -> dict[str, dict[str, str]]:

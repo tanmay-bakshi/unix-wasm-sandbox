@@ -7,7 +7,8 @@ use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
 use crate::core::{
     CancellationSource, CompletedProcess as CoreCompletedProcess, EventBus, FileSystemEvent,
-    HostMount, Limits, RunRequest, SandboxState, VirtualExecutableBridge, VirtualProcessRequest,
+    HostMount, Limits, PackageCommandAlias, PackageSpec, RunRequest, SandboxState,
+    VirtualExecutableBridge, VirtualProcessRequest,
 };
 
 #[pyclass(module = "unix_sandbox._native")]
@@ -91,9 +92,9 @@ impl Sandbox {
     pub fn new(
         files: HashMap<String, Option<Vec<u8>>>,
         host_mounts: Vec<(String, String, bool)>,
+        packages: Vec<(String, String, String, Vec<(String, String)>)>,
         cwd: String,
         env: HashMap<String, String>,
-        asset_dir: String,
         output_limit: usize,
         wall_time_seconds: Option<f64>,
         event_queue_size: usize,
@@ -113,9 +114,22 @@ impl Sandbox {
                             read_only,
                         })
                         .collect(),
+                    packages
+                        .into_iter()
+                        .map(
+                            |(name, webc_path, content_sha256, command_aliases)| PackageSpec {
+                                name,
+                                webc_path,
+                                content_sha256,
+                                command_aliases: command_aliases
+                                    .into_iter()
+                                    .map(|(alias, command)| PackageCommandAlias { alias, command })
+                                    .collect(),
+                            },
+                        )
+                        .collect(),
                     cwd,
                     env,
-                    asset_dir,
                     Limits {
                         output_bytes: output_limit,
                         wall_time_seconds,

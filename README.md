@@ -53,8 +53,8 @@ asyncio.run(main())
 
 ## API Shape
 
-`SandboxConfig` controls the initial filesystem, default working directory,
-default environment, and resource limits.
+`SandboxConfig` controls the package image, initial filesystem, default working
+directory, default environment, and resource limits.
 
 ```python
 from unix_sandbox import Directory, File, HostMount, Limits, SandboxConfig
@@ -76,6 +76,50 @@ config = SandboxConfig(
     event_queue_size=4096,
 )
 ```
+
+By default, `Sandbox()` uses the bundled standard image. For tighter or larger
+environments, compose an image explicitly:
+
+```python
+from unix_sandbox import PackageCommandAlias, Sandbox, SandboxConfig, SandboxImage, WasmerPackage
+
+image = SandboxImage.empty().with_packages(
+    WasmerPackage.bundled("coreutils"),
+    WasmerPackage.local_webc("ffmpeg", "./ffmpeg.webc"),
+)
+
+sandbox = Sandbox(SandboxConfig(image=image))
+```
+
+Images are ordered package sets. Bundled packages are loaded from the package's
+verified assets, local packages are hashed before use, and URL-backed packages
+must include the expected SHA-256 digest:
+
+```python
+image = SandboxImage.standard().without("python").with_packages(
+    WasmerPackage.url_webc(
+        "ffmpeg",
+        "https://example.com/ffmpeg.webc",
+        sha256="0" * 64,
+    ),
+)
+```
+
+Package commands are exposed on `/bin` and `/usr/bin` by default. Additional
+aliases can be declared on the package:
+
+```python
+image = SandboxImage.empty().with_packages(
+    WasmerPackage.bundled(
+        "python",
+        command_aliases=[PackageCommandAlias("python3", "python")],
+    ),
+)
+```
+
+Command collisions fail during sandbox construction, which keeps image
+composition deterministic. Use `VirtualExecutable` for trusted host-backed tools
+that should appear as sandbox executables without running inside Wasmer.
 
 `Sandbox.run()` is async and does not block the Python event loop while the
 Wasmer process executes.

@@ -1,4 +1,6 @@
 import asyncio
+import gzip
+from importlib import resources
 from pathlib import Path
 
 import pytest
@@ -9,12 +11,15 @@ from unix_sandbox import (
     File,
     HostMount,
     Limits,
+    PackageCommandAlias,
     Sandbox,
     SandboxConfig,
     SandboxError,
     SandboxEvent,
     SandboxEventKind,
+    SandboxImage,
     VirtualExecutable,
+    WasmerPackage,
 )
 
 
@@ -82,6 +87,80 @@ async def test_standard_utility_processes_run() -> None:
 
     gzip = await sandbox.run(["gzip", "-c", "/work/data/first.txt"], check=True)
     assert len(gzip.stdout) > 0
+
+
+@pytest.mark.asyncio
+async def test_custom_image_can_use_subset_of_bundled_packages() -> None:
+    """Verify that sandboxes can opt into only selected bundled packages."""
+    image = SandboxImage.empty().with_packages(WasmerPackage.bundled("coreutils"))
+    sandbox = Sandbox(SandboxConfig(image=image))
+
+    cat = await sandbox.run(["cat"], input="abc", check=True)
+    assert cat.stdout_text == "abc"
+
+    with pytest.raises(SandboxError, match="command not found"):
+        await sandbox.run(["python", "-c", "print(6 * 7)"])
+
+
+@pytest.mark.asyncio
+async def test_custom_image_can_load_local_webc_package(tmp_path: Path) -> None:
+    """Verify that image packages can be supplied from local WEBC files."""
+    source = resources.files("unix_sandbox").joinpath("assets/gzip.webc.gz")
+    package_path = tmp_path / "gzip.webc"
+    package_path.write_bytes(gzip.decompress(source.read_bytes()))
+
+    image = SandboxImage.empty().with_packages(
+        WasmerPackage.local_webc("gzip-local", package_path),
+    )
+    sandbox = Sandbox(
+        SandboxConfig(
+            image=image,
+            files={"/work/input.txt": File.text("abc")},
+        ),
+    )
+
+    result = await sandbox.run(["gzip", "-c", "/work/input.txt"], check=True)
+    assert len(result.stdout) > 0
+
+
+@pytest.mark.asyncio
+async def test_package_command_aliases_are_available_on_path() -> None:
+    """Verify that package commands can expose image-defined aliases."""
+    image = SandboxImage.empty().with_packages(
+        WasmerPackage.bundled(
+            "python",
+            command_aliases=[PackageCommandAlias("python3", "python")],
+        ),
+    )
+    sandbox = Sandbox(SandboxConfig(image=image))
+
+    result = await sandbox.run(["python3", "-c", "print(6 * 7)"], check=True)
+    assert result.stdout_text == "42\n"
+
+
+def test_image_rejects_duplicate_package_names() -> None:
+    """Verify that image package names are unique."""
+    with pytest.raises(ValueError, match="configured more than once"):
+        SandboxImage.from_packages(
+            [
+                WasmerPackage.bundled("gzip"),
+                WasmerPackage.bundled("gzip"),
+            ],
+        )
+
+
+def test_image_rejects_command_collisions() -> None:
+    """Verify that command collisions fail at sandbox construction time."""
+    image = SandboxImage.empty().with_packages(
+        WasmerPackage.bundled("coreutils"),
+        WasmerPackage.bundled(
+            "gzip",
+            command_aliases=[PackageCommandAlias("cat", "gzip")],
+        ),
+    )
+
+    with pytest.raises(SandboxError, match="command path collision"):
+        Sandbox(SandboxConfig(image=image))
 
 
 @pytest.mark.asyncio

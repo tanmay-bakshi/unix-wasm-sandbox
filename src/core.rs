@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     io::{self, SeekFrom},
     path::{Path, PathBuf},
@@ -36,19 +36,8 @@ use wasmer_wasix::{
 };
 use webc::metadata::annotations::Wasi;
 
-static CATALOGS: Lazy<Mutex<HashMap<PathBuf, Arc<PackageCatalog>>>> =
+static CATALOGS: Lazy<Mutex<HashMap<String, Arc<PackageCatalog>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-
-const STANDARD_PACKAGE_NAMES: &[&str] = &[
-    "coreutils",
-    "bash",
-    "grep",
-    "sed",
-    "find",
-    "tar",
-    "gzip",
-    "python",
-];
 
 const COMMAND_PATH_PREFIXES: &[&str] = &["/bin", "/usr/bin"];
 const VIRTUAL_EXEC_BRIDGE_PATH: &str = "/dev/unix-sandbox-virtual-exec";
@@ -231,6 +220,28 @@ pub struct HostMount {
     pub source: String,
     pub target: String,
     pub read_only: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PackageCommandAlias {
+    pub alias: String,
+    pub command: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PackageSpec {
+    pub name: String,
+    pub webc_path: String,
+    pub content_sha256: String,
+    pub command_aliases: Vec<PackageCommandAlias>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedPackageSpec {
+    name: String,
+    webc_path: PathBuf,
+    content_sha256: String,
+    command_aliases: Vec<PackageCommandAlias>,
 }
 
 #[derive(Clone)]
@@ -1621,14 +1632,14 @@ impl SandboxState {
     pub fn new(
         files: HashMap<String, Option<Vec<u8>>>,
         host_mounts: Vec<HostMount>,
+        packages: Vec<PackageSpec>,
         cwd: String,
         env: HashMap<String, String>,
-        asset_dir: String,
         limits: Limits,
         events: EventBus,
         virtual_processes: VirtualExecutableBridge,
     ) -> Result<Self> {
-        let catalog = catalog_for(asset_dir)?;
+        let catalog = catalog_for(packages)?;
         let fs = TmpFileSystem::new();
         create_default_layout(&catalog, &fs)?;
         let cwd = normalize_path(&cwd)?;
@@ -1795,7 +1806,7 @@ impl SandboxState {
 }
 
 impl PackageCatalog {
-    fn load(asset_dir: PathBuf) -> Result<Arc<Self>> {
+    fn load(package_specs: Vec<ResolvedPackageSpec>) -> Result<Arc<Self>> {
         let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("unix-sandbox-wasmer")
@@ -1807,26 +1818,25 @@ impl PackageCatalog {
         let mut runtime = PluggableRuntime::new(task_manager);
         runtime.set_engine(sandbox_engine());
         runtime.set_package_loader(BuiltinPackageLoader::new());
-        runtime.set_source(
-            InMemorySource::from_directory_tree(&asset_dir)
-                .with_context(|| format!("unable to index assets in {}", asset_dir.display()))?,
-        );
+        runtime.set_source(package_source(&package_specs)?);
 
         let runtime = Arc::new(runtime);
         let mut packages = HashMap::new();
         let mut command_paths = HashMap::new();
 
-        for package_name in STANDARD_PACKAGE_NAMES {
-            let package = load_package(
-                &handle,
-                runtime.as_ref(),
-                &asset_dir.join(format!("{package_name}.webc")),
-            )?;
-            register_package(package_name, &package, &mut command_paths);
-            packages.insert((*package_name).to_string(), Arc::new(package));
+        for spec in package_specs {
+            let package = load_package(&handle, runtime.as_ref(), &spec.webc_path)?;
+            register_package(&spec.name, &package, &mut command_paths)?;
+            for alias in spec.command_aliases {
+                register_command_alias(
+                    &alias.alias,
+                    &spec.name,
+                    &alias.command,
+                    &mut command_paths,
+                )?;
+            }
+            packages.insert(spec.name, Arc::new(package));
         }
-
-        register_command_alias("python3", "python", "python", &mut command_paths);
 
         Ok(Arc::new(Self {
             runtime,
@@ -2427,26 +2437,139 @@ fn normalize_process_outcome(command: &str, returncode: i32, stderr: Vec<u8>) ->
     (returncode, stderr)
 }
 
-fn catalog_for(asset_dir: String) -> Result<Arc<PackageCatalog>> {
-    let asset_dir = PathBuf::from(asset_dir)
-        .canonicalize()
-        .context("unable to resolve asset directory")?;
-
+fn catalog_for(packages: Vec<PackageSpec>) -> Result<Arc<PackageCatalog>> {
+    let package_specs = resolve_package_specs(packages)?;
+    let cache_key = package_catalog_cache_key(&package_specs);
     if let Some(catalog) = CATALOGS
         .lock()
         .map_err(|_| anyhow!("package catalog lock failed"))?
-        .get(&asset_dir)
+        .get(&cache_key)
         .cloned()
     {
         return Ok(catalog);
     }
 
-    let catalog = PackageCatalog::load(asset_dir.clone())?;
+    let catalog = PackageCatalog::load(package_specs)?;
     CATALOGS
         .lock()
         .map_err(|_| anyhow!("package catalog lock failed"))?
-        .insert(asset_dir, Arc::clone(&catalog));
+        .insert(cache_key, Arc::clone(&catalog));
     Ok(catalog)
+}
+
+fn resolve_package_specs(packages: Vec<PackageSpec>) -> Result<Vec<ResolvedPackageSpec>> {
+    let mut resolved = Vec::with_capacity(packages.len());
+    let mut names = HashSet::with_capacity(packages.len());
+    for package in packages {
+        validate_package_name(&package.name)?;
+        if !names.insert(package.name.clone()) {
+            return Err(anyhow!(
+                "package name configured more than once: {}",
+                package.name
+            ));
+        }
+        validate_sha256(&package.content_sha256, &package.name)?;
+        for alias in &package.command_aliases {
+            validate_command_name(&alias.alias, "alias")?;
+            validate_command_name(&alias.command, "command")?;
+        }
+        let webc_path = PathBuf::from(&package.webc_path)
+            .canonicalize()
+            .with_context(|| format!("unable to resolve package {}", package.name))?;
+        resolved.push(ResolvedPackageSpec {
+            name: package.name,
+            webc_path,
+            content_sha256: package.content_sha256,
+            command_aliases: package.command_aliases,
+        });
+    }
+    Ok(resolved)
+}
+
+fn validate_package_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(anyhow!("package name cannot be empty"));
+    }
+    if name.as_bytes().contains(&0) {
+        return Err(anyhow!("package name cannot contain NUL bytes"));
+    }
+    Ok(())
+}
+
+fn validate_command_name(command: &str, label: &str) -> Result<()> {
+    if command.is_empty() {
+        return Err(anyhow!("package command {label} cannot be empty"));
+    }
+    if command.as_bytes().contains(&0) {
+        return Err(anyhow!("package command {label} cannot contain NUL bytes"));
+    }
+    if command.contains('/') {
+        return Err(anyhow!(
+            "package command {label} cannot contain path separators"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sha256(digest: &str, package_name: &str) -> Result<()> {
+    if digest.len() != 64 {
+        return Err(anyhow!(
+            "package {package_name} content_sha256 must contain 64 hexadecimal characters"
+        ));
+    }
+    if digest
+        .chars()
+        .all(|character| character.is_ascii_hexdigit())
+    {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "package {package_name} content_sha256 must contain 64 hexadecimal characters"
+    ))
+}
+
+fn package_catalog_cache_key(package_specs: &[ResolvedPackageSpec]) -> String {
+    let mut key = String::new();
+    for spec in package_specs {
+        key.push_str(&spec.name);
+        key.push('\0');
+        key.push_str(&spec.webc_path.to_string_lossy());
+        key.push('\0');
+        key.push_str(&spec.content_sha256);
+        key.push('\0');
+        for alias in &spec.command_aliases {
+            key.push_str(&alias.alias);
+            key.push('\0');
+            key.push_str(&alias.command);
+            key.push('\0');
+        }
+        key.push('\x1f');
+    }
+    key
+}
+
+fn package_source(package_specs: &[ResolvedPackageSpec]) -> Result<InMemorySource> {
+    let mut parents = package_specs
+        .iter()
+        .filter_map(|spec| spec.webc_path.parent());
+    if let Some(first_parent) = parents.next() {
+        if parents.all(|parent| parent == first_parent) {
+            return InMemorySource::from_directory_tree(first_parent).with_context(|| {
+                format!(
+                    "unable to index package directory {}",
+                    first_parent.display()
+                )
+            });
+        }
+    }
+
+    let mut source = InMemorySource::new();
+    for spec in package_specs {
+        source
+            .add_webc(&spec.webc_path)
+            .with_context(|| format!("unable to index package {}", spec.name))?;
+    }
+    Ok(source)
 }
 
 fn load_package(
@@ -2466,10 +2589,11 @@ fn register_package(
     name: &str,
     package: &BinaryPackage,
     command_paths: &mut HashMap<PathBuf, CommandTarget>,
-) {
+) -> Result<()> {
     for command in &package.commands {
-        register_command_alias(command.name(), name, command.name(), command_paths);
+        register_command_alias(command.name(), name, command.name(), command_paths)?;
     }
+    Ok(())
 }
 
 fn register_command_alias(
@@ -2477,14 +2601,29 @@ fn register_command_alias(
     package: &str,
     command: &str,
     command_paths: &mut HashMap<PathBuf, CommandTarget>,
-) {
+) -> Result<()> {
     let target = CommandTarget {
         package: package.to_string(),
         command: command.to_string(),
     };
     for prefix in COMMAND_PATH_PREFIXES {
-        command_paths.insert(Path::new(prefix).join(alias), target.clone());
+        let path = Path::new(prefix).join(alias);
+        if let Some(existing) = command_paths.get(&path) {
+            if existing.package == target.package && existing.command == target.command {
+                continue;
+            }
+            return Err(anyhow!(
+                "command path collision at {}: {} from package {} conflicts with {} from package {}",
+                path.display(),
+                target.command,
+                target.package,
+                existing.command,
+                existing.package,
+            ));
+        }
+        command_paths.insert(path, target.clone());
     }
+    Ok(())
 }
 
 fn sandbox_engine() -> wasmer::Engine {
