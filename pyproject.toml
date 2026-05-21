@@ -40,6 +40,7 @@ features = ["extension-module"]
 include = [
     { path = "python/unix_sandbox/assets/*.webc.gz", format = "wheel" },
     { path = "python/unix_sandbox/assets/*.json", format = "wheel" },
+    { path = "vendor/wasmer-compiler-llvm/**/*", format = "sdist" },
 ]
 
 [tool.pytest.ini_options]

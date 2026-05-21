@@ -4258,8 +4258,6 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler-llvm"
 version = "7.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c1094c344efb6dac36fdbebb417159491282efaac74e565d57562332af71233"
 dependencies = [
  "byteorder",
  "cc",

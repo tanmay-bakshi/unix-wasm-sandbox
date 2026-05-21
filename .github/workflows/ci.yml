@@ -18,6 +18,8 @@ jobs:
         platform:
           - name: Linux x64
             os: ubuntu-22.04
+          - name: Linux arm64
+            os: ubuntu-24.04-arm
           - name: macOS x64
             os: macos-15-intel
           - name: macOS arm64
@@ -29,6 +31,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - uses: astral-sh/setup-uv@v5
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install LLVM Build Dependencies
+        run: scripts/install_llvm_build_deps.sh
       - name: Create environment
         run: uv venv --python "$(command -v python)"
       - name: Install package
@@ -49,4 +53,7 @@ jobs:
         run: uv run pytest
       - name: Build Release Wheel
         if: ${{ matrix.python-version == '3.12' }}
-        run: uv run maturin build --release --out dist
+        run: uv run maturin build --release --out dist --auditwheel=repair
+      - name: Verify Wheel Dependencies
+        if: ${{ matrix.python-version == '3.12' }}
+        run: python scripts/verify_wheel_dependencies.py dist/*.whl
