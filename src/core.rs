@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    env,
     future::Future,
     io::{self, SeekFrom},
     path::{Path, PathBuf},
@@ -14,7 +15,6 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncWrite, AsyncWriteExt, ReadBuf};
 use virtual_fs::{
@@ -22,22 +22,19 @@ use virtual_fs::{
     NullFile, OpenOptionsConfig, OverlayFileSystem, ReadDir, StaticFile, TmpFileSystem,
     UnionFileSystem, UnionMergeMode, VirtualFile,
 };
-use wasmer::sys::{BaseTunables, Cranelift, EngineBuilder, Features, NativeEngineExt};
+use wasmer::sys::{BaseTunables, EngineBuilder, Features, NativeEngineExt, LLVM};
 use wasmer_package::utils::from_bytes;
 use wasmer_wasix::{
     bin_factory::{spawn_exec, BinaryPackage},
     runtime::{
+        module_cache::{FileSystemCache, ModuleCache, SharedCache},
         package_loader::BuiltinPackageLoader,
         resolver::InMemorySource,
-        task_manager::{tokio::TokioTaskManager, VirtualTaskManagerExt},
+        task_manager::{tokio::TokioTaskManager, VirtualTaskManager, VirtualTaskManagerExt},
     },
-    wasmer_wasix_types::types::Signal,
     PluggableRuntime, Runtime, WasiEnvBuilder,
 };
 use webc::metadata::annotations::Wasi;
-
-static CATALOGS: Lazy<Mutex<HashMap<String, Arc<PackageCatalog>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
 
 const COMMAND_PATH_PREFIXES: &[&str] = &["/bin", "/usr/bin"];
 const VIRTUAL_EXEC_BRIDGE_PATH: &str = "/dev/unix-sandbox-virtual-exec";
@@ -240,7 +237,6 @@ pub struct PackageSpec {
 struct ResolvedPackageSpec {
     name: String,
     webc_path: PathBuf,
-    content_sha256: String,
     command_aliases: Vec<PackageCommandAlias>,
 }
 
@@ -1814,9 +1810,14 @@ impl PackageCatalog {
             .context("unable to create Wasmer runtime")?;
         let handle = tokio_runtime.handle().clone();
         let task_manager = Arc::new(TokioTaskManager::new(tokio_runtime));
+        let virtual_task_manager: Arc<dyn VirtualTaskManager> = task_manager.clone();
         let _runtime_guard = handle.enter();
-        let mut runtime = PluggableRuntime::new(task_manager);
+        let mut runtime = PluggableRuntime::new(virtual_task_manager);
         runtime.set_engine(sandbox_engine());
+        runtime.set_module_cache(SharedCache::default().with_fallback(FileSystemCache::new(
+            module_cache_dir(),
+            Arc::clone(&task_manager),
+        )));
         runtime.set_package_loader(BuiltinPackageLoader::new());
         runtime.set_source(package_source(&package_specs)?);
 
@@ -2108,37 +2109,43 @@ impl PackageCatalog {
 
         let exit_code = tasks.spawn_and_block_on(async move {
             let mut cancellation = cancellation;
-            let run = async move {
-                let mut task_handle = spawn_exec(package, &command_name, env, &runtime)
-                    .await
-                    .context("spawn failed")?;
-                let exit_code = task_handle
-                    .wait_finished()
-                    .await
-                    .map_err(|error| anyhow!(error.to_string()))?;
-                Ok::<_, anyhow::Error>(exit_code)
+
+            let spawn = spawn_exec(package, &command_name, env, &runtime);
+            let mut task_handle = tokio::select! {
+                result = spawn => result.context("spawn failed")?,
+                _ = cancellation.cancelled() => {
+                    return Err(anyhow!("process cancelled"));
+                }
             };
+
+            let wait_finished = task_handle.wait_finished();
+            tokio::pin!(wait_finished);
 
             let exit_code = if let Some(timeout) = wall_time {
                 tokio::select! {
-                    result = run => result?,
+                    result = &mut wait_finished => result
+                        .map_err(|error| anyhow!(error.to_string()))?,
                     _ = tokio::time::sleep(timeout) => {
-                        process.signal_process(Signal::Sigkill);
+                        process.terminate(126_i32.into());
+                        let _ = wait_finished.await;
                         return Err(anyhow!(
                             "process exceeded wall time limit of {:.3} seconds",
                             timeout.as_secs_f64()
                         ));
                     }
                     _ = cancellation.cancelled() => {
-                        process.signal_process(Signal::Sigkill);
+                        process.terminate(126_i32.into());
+                        let _ = wait_finished.await;
                         return Err(anyhow!("process cancelled"));
                     }
                 }
             } else {
                 tokio::select! {
-                    result = run => result?,
+                    result = &mut wait_finished => result
+                        .map_err(|error| anyhow!(error.to_string()))?,
                     _ = cancellation.cancelled() => {
-                        process.signal_process(Signal::Sigkill);
+                        process.terminate(126_i32.into());
+                        let _ = wait_finished.await;
                         return Err(anyhow!("process cancelled"));
                     }
                 }
@@ -2439,22 +2446,7 @@ fn normalize_process_outcome(command: &str, returncode: i32, stderr: Vec<u8>) ->
 
 fn catalog_for(packages: Vec<PackageSpec>) -> Result<Arc<PackageCatalog>> {
     let package_specs = resolve_package_specs(packages)?;
-    let cache_key = package_catalog_cache_key(&package_specs);
-    if let Some(catalog) = CATALOGS
-        .lock()
-        .map_err(|_| anyhow!("package catalog lock failed"))?
-        .get(&cache_key)
-        .cloned()
-    {
-        return Ok(catalog);
-    }
-
-    let catalog = PackageCatalog::load(package_specs)?;
-    CATALOGS
-        .lock()
-        .map_err(|_| anyhow!("package catalog lock failed"))?
-        .insert(cache_key, Arc::clone(&catalog));
-    Ok(catalog)
+    PackageCatalog::load(package_specs)
 }
 
 fn resolve_package_specs(packages: Vec<PackageSpec>) -> Result<Vec<ResolvedPackageSpec>> {
@@ -2479,7 +2471,6 @@ fn resolve_package_specs(packages: Vec<PackageSpec>) -> Result<Vec<ResolvedPacka
         resolved.push(ResolvedPackageSpec {
             name: package.name,
             webc_path,
-            content_sha256: package.content_sha256,
             command_aliases: package.command_aliases,
         });
     }
@@ -2528,41 +2519,7 @@ fn validate_sha256(digest: &str, package_name: &str) -> Result<()> {
     ))
 }
 
-fn package_catalog_cache_key(package_specs: &[ResolvedPackageSpec]) -> String {
-    let mut key = String::new();
-    for spec in package_specs {
-        key.push_str(&spec.name);
-        key.push('\0');
-        key.push_str(&spec.webc_path.to_string_lossy());
-        key.push('\0');
-        key.push_str(&spec.content_sha256);
-        key.push('\0');
-        for alias in &spec.command_aliases {
-            key.push_str(&alias.alias);
-            key.push('\0');
-            key.push_str(&alias.command);
-            key.push('\0');
-        }
-        key.push('\x1f');
-    }
-    key
-}
-
 fn package_source(package_specs: &[ResolvedPackageSpec]) -> Result<InMemorySource> {
-    let mut parents = package_specs
-        .iter()
-        .filter_map(|spec| spec.webc_path.parent());
-    if let Some(first_parent) = parents.next() {
-        if parents.all(|parent| parent == first_parent) {
-            return InMemorySource::from_directory_tree(first_parent).with_context(|| {
-                format!(
-                    "unable to index package directory {}",
-                    first_parent.display()
-                )
-            });
-        }
-    }
-
     let mut source = InMemorySource::new();
     for spec in package_specs {
         source
@@ -2630,12 +2587,33 @@ fn sandbox_engine() -> wasmer::Engine {
     let mut features = Features::default();
     features.exceptions(true);
 
-    let mut engine: wasmer::Engine = EngineBuilder::new(Cranelift::default())
+    let mut engine: wasmer::Engine = EngineBuilder::new(LLVM::default())
         .set_features(Some(features))
         .into();
     let tunables = BaseTunables::for_target(engine.target());
     engine.set_tunables(tunables);
     engine
+}
+
+fn module_cache_dir() -> PathBuf {
+    if let Some(cache_home) = env::var_os("XDG_CACHE_HOME") {
+        if !cache_home.is_empty() {
+            return PathBuf::from(cache_home)
+                .join("unix-wasm-sandbox")
+                .join("modules");
+        }
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home)
+                .join(".cache")
+                .join("unix-wasm-sandbox")
+                .join("modules");
+        }
+    }
+
+    env::temp_dir().join("unix-wasm-sandbox").join("modules")
 }
 
 fn duration_from_seconds(seconds: f64) -> Result<Duration> {

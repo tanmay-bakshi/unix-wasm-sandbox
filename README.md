@@ -5,9 +5,9 @@ running isolated UNIX-like Wasmer environments from async Python code.
 
 The default sandbox starts with an in-memory filesystem, a working directory at
 `/work`, common coreutils, Bash, text/archive utilities, gzip, and CPython
-3.12.0. Commands run inside Wasmer WASIX and expose captured stdin, stdout,
-stderr, return codes, working directory, and environment overrides through a
-small Python API.
+3.13 with WASIX dynamic-linking support. Commands run inside Wasmer WASIX and
+expose captured stdin, stdout, stderr, return codes, working directory, and
+environment overrides through a small Python API.
 
 ## Install
 
@@ -20,6 +20,8 @@ uv pip install -e ".[dev]"
 
 The package contains compressed WEBC assets. On first use, those assets are
 expanded into `XDG_CACHE_HOME/unix-wasm-sandbox` or `~/.cache/unix-wasm-sandbox`.
+Compiled Wasmer modules are cached there as well, so larger packages such as
+Python pay their compilation cost once per local cache.
 
 ## Quickstart
 
@@ -248,7 +250,7 @@ The bundled standard image is pinned and hash-verified:
 - `wasmer/find@4.10.0`
 - `wasmer/tar@1.35.0`
 - `wasmer/gzip@1.14.0`
-- `python/python@0.2.0`, CPython 3.12.0
+- `python/python@3.13.5`, CPython 3.13.0rc2 with WASIX dynamic linking
 
 Regenerate the compressed assets with:
 

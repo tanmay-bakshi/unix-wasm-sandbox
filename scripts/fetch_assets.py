@@ -55,9 +55,9 @@ ASSETS: dict[str, dict[str, str]] = {
     },
     "python": {
         "package": "python/python",
-        "version": "0.2.0",
-        "sha256": "47ff83d2d205df14e7f057a1f0a1c1da70c565d2e32c052f2970a150f5a9b407",
-        "url": "https://cdn.wasmer.io/webcimages/47ff83d2d205df14e7f057a1f0a1c1da70c565d2e32c052f2970a150f5a9b407.webc",
+        "version": "3.13.5",
+        "sha256": "c03ebe0946e66edf598fd7a1f192101f60e4e9c0095aecd04e049989692bdcab",
+        "url": "https://cdn.wasmer.io/webcimages/c03ebe0946e66edf598fd7a1f192101f60e4e9c0095aecd04e049989692bdcab.webc",
     },
 }
 

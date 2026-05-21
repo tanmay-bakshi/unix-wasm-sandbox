@@ -13,6 +13,7 @@ import struct
 import tempfile
 import traceback
 import urllib.request
+import weakref
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -736,6 +737,14 @@ class Sandbox:
                 replace=executable.replace,
             )
 
+    def __del__(self) -> None:
+        """Release native registrations owned by this sandbox."""
+        try:
+            self._shutdown_event_handlers()
+            self.close_virtual_executables()
+        except Exception:
+            LOGGER.debug("sandbox destructor cleanup failed\n%s", traceback.format_exc())
+
     async def __aenter__(self) -> Self:
         """:returns: This sandbox."""
         return self
@@ -817,8 +826,9 @@ class Sandbox:
         if task is not None and not task.done():
             return
         loop = asyncio.get_running_loop()
+        sandbox_reference = weakref.ref(self)
         self._virtual_executable_dispatch_task = loop.create_task(
-            self._dispatch_virtual_processes()
+            _dispatch_virtual_processes(sandbox_reference)
         )
 
     def _cancel_virtual_executable_requests(self) -> None:
@@ -827,12 +837,6 @@ class Sandbox:
             if task.done():
                 continue
             task.cancel()
-
-    async def _dispatch_virtual_processes(self) -> None:
-        """Deliver virtual executable invocations to registered handlers."""
-        while len(self._virtual_executable_handlers) > 0:
-            request_id, payload = await self._native_sandbox.next_virtual_process()
-            self._start_virtual_process_request(request_id, payload)
 
     def _start_virtual_process_request(self, request_id: int, payload: bytes) -> None:
         """:param request_id: Native request identifier.
@@ -1119,16 +1123,26 @@ class Sandbox:
         self._ensure_virtual_executable_dispatcher()
         process_token = self._next_process_token
         self._next_process_token += 1
-        try:
-            native_result = await self._native_sandbox.run(
+        native_task = asyncio.ensure_future(
+            self._native_sandbox.run(
                 process_token,
                 list(args),
                 input_bytes,
                 env,
                 cwd,
             )
+        )
+        try:
+            native_result = await asyncio.shield(native_task)
         except asyncio.CancelledError:
             self._native_sandbox.cancel_process(process_token)
+            try:
+                await native_task
+            except Exception:
+                LOGGER.debug(
+                    "native process cancellation cleanup failed\n%s",
+                    traceback.format_exc(),
+                )
             raise
         except RuntimeError as error:
             raise SandboxError(str(error)) from error
@@ -1230,6 +1244,33 @@ class Sandbox:
             return await self._native_sandbox.listdir(path)
         except RuntimeError as error:
             raise SandboxError(str(error)) from error
+
+
+async def _dispatch_virtual_processes(
+    sandbox_reference: weakref.ReferenceType[Sandbox],
+) -> None:
+    """:param sandbox_reference: Sandbox that owns virtual executable handlers."""
+    try:
+        while True:
+            sandbox = sandbox_reference()
+            if sandbox is None:
+                return
+            if len(sandbox._virtual_executable_handlers) == 0:
+                return
+            native_sandbox = sandbox._native_sandbox
+            del sandbox
+
+            request_id, payload = await native_sandbox.next_virtual_process()
+
+            sandbox = sandbox_reference()
+            if sandbox is None:
+                return
+            sandbox._start_virtual_process_request(request_id, payload)
+    finally:
+        sandbox = sandbox_reference()
+        if sandbox is not None:
+            sandbox._virtual_executable_dispatch_task = None
+            sandbox._cancel_virtual_executable_requests()
 
 
 def _normalize_package_command_aliases(

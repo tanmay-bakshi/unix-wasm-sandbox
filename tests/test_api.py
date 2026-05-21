@@ -61,6 +61,30 @@ async def test_python_process_runs_in_standard_image() -> None:
 
 
 @pytest.mark.asyncio
+async def test_python_process_loads_wasix_shared_library() -> None:
+    """Verify that bundled Python can load WASIX shared libraries."""
+    sandbox = Sandbox()
+    result = await sandbox.run(
+        [
+            "python",
+            "-c",
+            (
+                "import ctypes, sysconfig\n"
+                "library = ctypes.CDLL('/lib/libsqlite3.so')\n"
+                "library.sqlite3_libversion_number.restype = ctypes.c_int\n"
+                "print(sysconfig.get_config_var('EXT_SUFFIX'))\n"
+                "print(library.sqlite3_libversion_number())\n"
+            ),
+        ],
+        check=True,
+    )
+
+    suffix, sqlite_version = result.stdout_text.splitlines()
+    assert suffix == ".cpython-313-wasm32-wasi.so"
+    assert int(sqlite_version) > 0
+
+
+@pytest.mark.asyncio
 async def test_standard_utility_processes_run() -> None:
     """Verify that the standard image includes common UNIX utilities."""
     sandbox = Sandbox(
