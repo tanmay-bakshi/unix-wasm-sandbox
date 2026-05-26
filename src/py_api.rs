@@ -6,9 +6,9 @@ use std::{
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
 use crate::core::{
-    CancellationSource, CompletedProcess as CoreCompletedProcess, EventBus, FileSystemEvent,
-    HostMount, Limits, PackageCommandAlias, PackageSpec, RunRequest, SandboxState,
-    VirtualExecutableBridge, VirtualProcessRequest,
+    CancellationSource, CapturedOutput, CompletedProcess as CoreCompletedProcess, EventBus,
+    FileSystemEvent, HostMount, InteractiveStdin, Limits, PackageCommandAlias, PackageSpec,
+    ProcessStreams, RunRequest, SandboxState, VirtualExecutableBridge, VirtualProcessRequest,
 };
 
 #[pyclass(module = "unix_sandbox._native")]
@@ -31,6 +31,91 @@ impl From<CoreCompletedProcess> for CompletedProcess {
             stdout: process.stdout,
             stderr: process.stderr,
         }
+    }
+}
+
+#[derive(Clone)]
+enum ProcessOutcome {
+    Completed(CoreCompletedProcess),
+    Failed(String),
+}
+
+#[pyclass(module = "unix_sandbox._native")]
+pub struct StartedProcess {
+    id: u64,
+    args: Vec<String>,
+    stdin: InteractiveStdin,
+    stdout: CapturedOutput,
+    stderr: CapturedOutput,
+    result_receiver: tokio::sync::watch::Receiver<Option<ProcessOutcome>>,
+    running_processes: Arc<Mutex<HashMap<u64, CancellationSource>>>,
+}
+
+#[pymethods]
+impl StartedProcess {
+    #[getter]
+    fn args(&self) -> Vec<String> {
+        self.args.clone()
+    }
+
+    #[getter]
+    fn returncode(&self) -> Option<i32> {
+        match &*self.result_receiver.borrow() {
+            Some(ProcessOutcome::Completed(process)) => Some(process.returncode),
+            Some(ProcessOutcome::Failed(_)) | None => None,
+        }
+    }
+
+    #[getter]
+    fn stdin_closed(&self) -> PyResult<bool> {
+        self.stdin.is_closed().map_err(py_error)
+    }
+
+    #[getter]
+    fn stdout(&self) -> PyResult<Vec<u8>> {
+        self.stdout.capture("stdout").map_err(py_error)
+    }
+
+    #[getter]
+    fn stderr(&self) -> PyResult<Vec<u8>> {
+        self.stderr.capture("stderr").map_err(py_error)
+    }
+
+    fn is_running(&self) -> bool {
+        self.result_receiver.borrow().is_none()
+    }
+
+    fn write_stdin(&self, data: Vec<u8>) -> PyResult<()> {
+        self.stdin.write(data).map_err(py_error)
+    }
+
+    fn close_stdin(&self) -> PyResult<()> {
+        self.stdin.close().map_err(py_error)
+    }
+
+    fn cancel(&self) {
+        let _ = self.stdin.close();
+        cancel_process(&self.running_processes, self.id);
+    }
+
+    fn wait<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let result_receiver = self.result_receiver.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, wait_process_outcome(result_receiver))
+    }
+
+    fn wait_blocking(&self) -> PyResult<CompletedProcess> {
+        let result_receiver = self.result_receiver.clone();
+        pyo3_async_runtimes::tokio::get_runtime().block_on(wait_process_outcome(result_receiver))
+    }
+}
+
+impl Drop for StartedProcess {
+    fn drop(&mut self) {
+        if self.result_receiver.borrow().is_some() {
+            return;
+        }
+        let _ = self.stdin.close();
+        cancel_process(&self.running_processes, self.id);
     }
 }
 
@@ -259,6 +344,73 @@ impl Sandbox {
         cancel_process(&self.running_processes, id);
     }
 
+    fn start(
+        &self,
+        id: u64,
+        args: Vec<String>,
+        env: Option<HashMap<String, String>>,
+        cwd: Option<String>,
+    ) -> PyResult<StartedProcess> {
+        let state = self.state.clone();
+        let output_limit = state
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("sandbox state lock failed"))?
+            .limits
+            .output_bytes;
+        let stdin = InteractiveStdin::new();
+        let stdout = CapturedOutput::new(output_limit);
+        let stderr = CapturedOutput::new(output_limit);
+        let cancellation_source = CancellationSource::new();
+        let cancellation = cancellation_source.token();
+        let process_guard =
+            RunningProcessGuard::new(id, self.running_processes.clone(), cancellation_source)?;
+        let request = RunRequest {
+            args: args.clone(),
+            input: None,
+            env,
+            cwd,
+        };
+        let stdin_for_task = stdin.clone();
+        let streams = ProcessStreams {
+            stdin: Box::new(stdin.file()),
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+        };
+        let (result_sender, result_receiver) = tokio::sync::watch::channel(None);
+        let process_task = pyo3_async_runtimes::tokio::get_runtime().spawn_blocking(move || {
+            let mut process_guard = process_guard;
+            let result = (|| {
+                let state = state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("sandbox state lock failed"))?
+                    .clone();
+                state.run_with_stdio_blocking(request, streams, cancellation)
+            })();
+            process_guard.finish();
+            let _ = stdin_for_task.close();
+            match result {
+                Ok(process) => ProcessOutcome::Completed(process),
+                Err(error) => ProcessOutcome::Failed(error_message(error)),
+            }
+        });
+        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+            let outcome = match process_task.await {
+                Ok(outcome) => outcome,
+                Err(error) => ProcessOutcome::Failed(error.to_string()),
+            };
+            let _ = result_sender.send(Some(outcome));
+        });
+        Ok(StartedProcess {
+            id,
+            args,
+            stdin,
+            stdout,
+            stderr,
+            result_receiver,
+            running_processes: self.running_processes.clone(),
+        })
+    }
+
     fn exists<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let state = self.state.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -349,17 +501,44 @@ impl Sandbox {
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<CompletedProcess>()?;
+    module.add_class::<StartedProcess>()?;
     module.add_class::<Sandbox>()?;
     Ok(())
 }
 
 fn py_error(error: anyhow::Error) -> PyErr {
+    PyRuntimeError::new_err(error_message(error))
+}
+
+fn error_message(error: anyhow::Error) -> String {
     let message = error
         .chain()
         .map(|cause| cause.to_string())
         .collect::<Vec<_>>()
         .join(": ");
-    PyRuntimeError::new_err(message)
+    message
+}
+
+async fn wait_process_outcome(
+    mut result_receiver: tokio::sync::watch::Receiver<Option<ProcessOutcome>>,
+) -> PyResult<CompletedProcess> {
+    loop {
+        let outcome = { result_receiver.borrow().clone() };
+        if let Some(outcome) = outcome {
+            return process_outcome_result(outcome);
+        }
+        result_receiver
+            .changed()
+            .await
+            .map_err(|_| PyRuntimeError::new_err("process wait channel closed"))?;
+    }
+}
+
+fn process_outcome_result(outcome: ProcessOutcome) -> PyResult<CompletedProcess> {
+    match outcome {
+        ProcessOutcome::Completed(process) => Ok(CompletedProcess::from(process)),
+        ProcessOutcome::Failed(message) => Err(PyRuntimeError::new_err(message)),
+    }
 }
 
 fn cancel_process(processes: &Arc<Mutex<HashMap<u64, CancellationSource>>>, id: u64) {

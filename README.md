@@ -140,6 +140,36 @@ result = await sandbox.run(
 Captured stdout and stderr are capped while the process writes, so a process
 cannot fill host memory before `Limits.output_bytes` is enforced.
 
+For interactive commands, start the process first and write stdin while it is
+running. `start()`, `spawn()`, and `popen()` return the same `SandboxProcess`
+handle; choose the name that best fits the calling code.
+
+```python
+process = sandbox.popen(["python", "-u", "/work/chatty.py"])
+
+await process.write_stdin("first line\n")
+print(process.stdout_text)
+
+await process.write_stdin("second line\n")
+await process.close_stdin()
+
+result = await process.wait(check=True)
+print(result.stdout_text)
+```
+
+For the common "send input, close stdin, wait for completion" shape:
+
+```python
+process = sandbox.spawn(["cat"])
+result = await process.communicate("hello\n", check=True)
+```
+
+`SandboxProcess` exposes `args`, `returncode`, `running`, `stdin_closed`,
+current `stdout` and `stderr` snapshots, `write_stdin()`, `close_stdin()`,
+`wait()`, `communicate()`, and cancellation through `cancel()`, `terminate()`,
+or `kill()`. Use `aclose()` or an async context manager when a started process
+may leave a scope before it naturally exits.
+
 Host mounts are live views of host directories and are read-only by default.
 Use `HostMount(source, target, read_only=False)` only when sandbox writes should
 persist back to the host directory.

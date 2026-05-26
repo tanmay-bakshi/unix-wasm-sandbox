@@ -7,6 +7,26 @@ class CompletedProcess:
     stderr: bytes
 
 
+class StartedProcess:
+    args: list[str]
+    returncode: int | None
+    stdin_closed: bool
+    stdout: bytes
+    stderr: bytes
+
+    def is_running(self) -> bool: ...
+
+    def write_stdin(self, data: bytes) -> None: ...
+
+    def close_stdin(self) -> None: ...
+
+    def cancel(self) -> None: ...
+
+    def wait(self) -> Awaitable[CompletedProcess]: ...
+
+    def wait_blocking(self) -> CompletedProcess: ...
+
+
 class Sandbox:
     def __init__(
         self,
@@ -44,6 +64,14 @@ class Sandbox:
     def wait_virtual_process_cancelled(self, id: int) -> Awaitable[None]: ...
 
     def cancel_process(self, id: int) -> None: ...
+
+    def start(
+        self,
+        id: int,
+        args: list[str],
+        env: dict[str, str] | None,
+        cwd: str | None,
+    ) -> StartedProcess: ...
 
     def exists(self, path: str) -> Awaitable[bool]: ...
 

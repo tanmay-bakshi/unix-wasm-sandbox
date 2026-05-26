@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     future::Future,
     io::{self, SeekFrom},
@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
-    task::{Context as TaskContext, Poll},
+    task::{Context as TaskContext, Poll, Waker},
     time::{Duration, Instant},
 };
 
@@ -364,6 +364,12 @@ pub struct RunRequest {
     pub input: Option<Vec<u8>>,
     pub env: Option<HashMap<String, String>>,
     pub cwd: Option<String>,
+}
+
+pub(crate) struct ProcessStreams {
+    pub stdin: Box<dyn VirtualFile + Send + Sync + 'static>,
+    pub stdout: CapturedOutput,
+    pub stderr: CapturedOutput,
 }
 
 struct ProcessIo {
@@ -1799,6 +1805,16 @@ impl SandboxState {
     ) -> Result<CompletedProcess> {
         self.catalog.run(self, request, cancellation)
     }
+
+    pub(crate) fn run_with_stdio_blocking(
+        &self,
+        request: RunRequest,
+        streams: ProcessStreams,
+        cancellation: CancellationToken,
+    ) -> Result<CompletedProcess> {
+        self.catalog
+            .run_with_stdio(self, request, streams, cancellation)
+    }
 }
 
 impl PackageCatalog {
@@ -1857,12 +1873,39 @@ impl PackageCatalog {
         request: RunRequest,
         cancellation: CancellationToken,
     ) -> Result<CompletedProcess> {
+        let RunRequest {
+            args,
+            input,
+            env,
+            cwd,
+        } = request;
+        let input = input.unwrap_or_default();
+        let streams = ProcessStreams {
+            stdin: Box::new(StaticFile::new(input)),
+            stdout: CapturedOutput::new(state.limits.output_bytes),
+            stderr: CapturedOutput::new(state.limits.output_bytes),
+        };
+        let request = RunRequest {
+            args,
+            input: None,
+            env,
+            cwd,
+        };
+        self.run_with_stdio(state, request, streams, cancellation)
+    }
+
+    fn run_with_stdio(
+        &self,
+        state: &SandboxState,
+        request: RunRequest,
+        streams: ProcessStreams,
+        cancellation: CancellationToken,
+    ) -> Result<CompletedProcess> {
         if request.args.is_empty() {
             return Err(anyhow!("command arguments cannot be empty"));
         }
 
         let args = request.args;
-        let input = request.input.unwrap_or_default();
         let mut env = state.env.clone();
         if let Some(overrides) = request.env {
             env.extend(overrides);
@@ -1877,6 +1920,7 @@ impl PackageCatalog {
         };
         let target = match self.resolve_command(state, &args[0], &cwd, env.get("PATH"))? {
             ResolvedCommand::Virtual(target) => {
+                let input = self.read_stdin_to_end(streams.stdin)?;
                 return self.run_virtual_command(
                     args,
                     input,
@@ -1895,18 +1939,16 @@ impl PackageCatalog {
             .get(&target.package)
             .ok_or_else(|| anyhow!("package not loaded: {}", target.package))?;
 
-        let stdout = CapturedOutput::new(state.limits.output_bytes);
-        let stderr = CapturedOutput::new(state.limits.output_bytes);
-        let stdin = StaticFile::new(input);
-
         let injected_packages = self.injected_packages(&target.package);
+        let stdout = streams.stdout;
+        let stderr = streams.stderr;
 
         let run_result = self.run_package_command(
             ProcessIo {
                 args: args.iter().skip(1).cloned().collect(),
                 env,
                 cwd,
-                stdin: Box::new(stdin),
+                stdin: streams.stdin,
                 stdout: Box::new(stdout.file()),
                 stderr: Box::new(stderr.file()),
             },
@@ -1930,6 +1972,20 @@ impl PackageCatalog {
             returncode,
             stdout,
             stderr,
+        })
+    }
+
+    fn read_stdin_to_end(
+        &self,
+        mut stdin: Box<dyn VirtualFile + Send + Sync + 'static>,
+    ) -> Result<Vec<u8>> {
+        self.block_on(async move {
+            let mut input = Vec::new();
+            stdin
+                .read_to_end(&mut input)
+                .await
+                .context("unable to read process stdin")?;
+            Ok(input)
         })
     }
 
@@ -2199,7 +2255,24 @@ fn process_filesystem(
 }
 
 #[derive(Clone, Debug)]
-struct CapturedOutput {
+pub(crate) struct InteractiveStdin {
+    state: Arc<Mutex<InteractiveStdinState>>,
+}
+
+#[derive(Debug)]
+struct InteractiveStdinState {
+    data: VecDeque<u8>,
+    closed: bool,
+    waker: Option<Waker>,
+}
+
+#[derive(Debug)]
+pub(crate) struct InteractiveStdinFile {
+    state: Arc<Mutex<InteractiveStdinState>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedOutput {
     state: Arc<Mutex<CapturedOutputState>>,
 }
 
@@ -2216,8 +2289,172 @@ struct LimitedCaptureFile {
     cursor: u64,
 }
 
+impl InteractiveStdin {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(InteractiveStdinState {
+                data: VecDeque::new(),
+                closed: false,
+                waker: None,
+            })),
+        }
+    }
+
+    pub(crate) fn file(&self) -> InteractiveStdinFile {
+        InteractiveStdinFile {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    pub(crate) fn write(&self, data: Vec<u8>) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process stdin lock failed"))?;
+        if state.closed {
+            return Err(anyhow!("process stdin is closed"));
+        }
+        state.data.extend(data);
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn close(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process stdin lock failed"))?;
+        state.closed = true;
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_closed(&self) -> Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process stdin lock failed"))?;
+        Ok(state.closed)
+    }
+}
+
+impl AsyncSeek for InteractiveStdinFile {
+    fn start_seek(self: Pin<&mut Self>, _position: SeekFrom) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process stdin is not seekable",
+        ))
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<u64>> {
+        Poll::Ready(Ok(0))
+    }
+}
+
+impl AsyncRead for InteractiveStdinFile {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(io::Error::other("process stdin lock failed"))),
+        };
+        if state.data.is_empty() && state.closed {
+            return Poll::Ready(Ok(()));
+        }
+        if state.data.is_empty() {
+            state.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+
+        let read_len = buf.remaining().min(state.data.len());
+        let data = state.data.drain(..read_len).collect::<Vec<_>>();
+        buf.put_slice(&data);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for InteractiveStdinFile {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl VirtualFile for InteractiveStdinFile {
+    fn last_accessed(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn last_modified(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn created_time(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn size(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.data.len() as u64)
+            .unwrap_or_default()
+    }
+
+    fn set_len(&mut self, _new_size: u64) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn unlink(&mut self) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn poll_read_ready(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<usize>> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(io::Error::other("process stdin lock failed"))),
+        };
+        if !state.data.is_empty() {
+            return Poll::Ready(Ok(state.data.len()));
+        }
+        if state.closed {
+            return Poll::Ready(Ok(0));
+        }
+        state.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    fn poll_write_ready(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()))
+    }
+}
+
 impl CapturedOutput {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             state: Arc::new(Mutex::new(CapturedOutputState {
                 data: Vec::new(),
@@ -2234,7 +2471,7 @@ impl CapturedOutput {
         }
     }
 
-    fn capture(&self, stream_name: &str) -> Result<Vec<u8>> {
+    pub(crate) fn capture(&self, stream_name: &str) -> Result<Vec<u8>> {
         let state = self
             .state
             .lock()

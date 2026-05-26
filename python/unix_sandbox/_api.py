@@ -447,6 +447,187 @@ class CompletedProcess:
         )
 
 
+class SandboxProcess:
+    """A running sandbox process with writable standard input."""
+
+    _native_process: _native.StartedProcess
+    _completed_process: CompletedProcess | None
+
+    def __init__(self, native_process: _native.StartedProcess) -> None:
+        """:param native_process: Native process handle."""
+        self._native_process = native_process
+        self._completed_process = None
+
+    def __del__(self) -> None:
+        """Release a running process if the handle is abandoned."""
+        try:
+            if self._completed_process is not None:
+                return
+            if not self._native_process.is_running():
+                return
+            self._native_process.cancel()
+            self._native_process.wait_blocking()
+        except Exception:
+            LOGGER.debug("sandbox process destructor cleanup failed\n%s", traceback.format_exc())
+
+    async def __aenter__(self) -> Self:
+        """:returns: This running process."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """:param exc_type: Exception type raised in the context.
+        :param exc_value: Exception value raised in the context.
+        :param traceback: Traceback raised in the context.
+        """
+        await self.aclose()
+
+    @property
+    def args(self) -> tuple[str, ...]:
+        """:returns: Command arguments."""
+        return tuple(self._native_process.args)
+
+    @property
+    def returncode(self) -> int | None:
+        """:returns: Process return code when the process has finished."""
+        if self._completed_process is not None:
+            return self._completed_process.returncode
+        return self._native_process.returncode
+
+    @property
+    def running(self) -> bool:
+        """:returns: Whether the process is still running."""
+        return self._native_process.is_running()
+
+    @property
+    def stdin_closed(self) -> bool:
+        """:returns: Whether standard input has been closed."""
+        try:
+            return self._native_process.stdin_closed
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+
+    @property
+    def stdout(self) -> bytes:
+        """:returns: Captured standard output produced so far."""
+        try:
+            return self._native_process.stdout
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+
+    @property
+    def stderr(self) -> bytes:
+        """:returns: Captured standard error produced so far."""
+        try:
+            return self._native_process.stderr
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+
+    @property
+    def stdout_text(self) -> str:
+        """:returns: Captured standard output produced so far decoded as UTF-8."""
+        return self.stdout.decode()
+
+    @property
+    def stderr_text(self) -> str:
+        """:returns: Captured standard error produced so far decoded as UTF-8."""
+        return self.stderr.decode()
+
+    def write_stdin_nowait(self, data: bytes | str, encoding: str = "utf-8") -> None:
+        """:param data: Bytes or text to write to standard input.
+        :param encoding: Encoding to use for text input.
+        """
+        data_bytes = data.encode(encoding) if isinstance(data, str) else data
+        try:
+            self._native_process.write_stdin(data_bytes)
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+
+    async def write_stdin(self, data: bytes | str, encoding: str = "utf-8") -> None:
+        """:param data: Bytes or text to write to standard input.
+        :param encoding: Encoding to use for text input.
+        """
+        self.write_stdin_nowait(data, encoding)
+
+    def close_stdin_nowait(self) -> None:
+        """Close standard input."""
+        try:
+            self._native_process.close_stdin()
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+
+    async def close_stdin(self) -> None:
+        """Close standard input."""
+        self.close_stdin_nowait()
+
+    def cancel(self) -> None:
+        """Cancel the running process."""
+        self._native_process.cancel()
+
+    def terminate(self) -> None:
+        """Cancel the running process."""
+        self.cancel()
+
+    def kill(self) -> None:
+        """Cancel the running process."""
+        self.cancel()
+
+    async def aclose(self) -> None:
+        """Cancel the process and wait for native cleanup."""
+        self.cancel()
+        try:
+            await self.wait()
+        except asyncio.CancelledError:
+            with contextlib.suppress(SandboxError):
+                await self.wait()
+            raise
+        except SandboxError:
+            return
+
+    async def wait(self, *, check: bool = False) -> CompletedProcess:
+        """:param check: Whether to raise on a non-zero return code.
+        :returns: Completed process details.
+        :raises SandboxError: Raised when the process fails or check is true and the command fails.
+        """
+        if self._completed_process is None:
+            self._completed_process = await self._wait_native()
+        if check:
+            self._completed_process.check_returncode()
+        return self._completed_process
+
+    async def communicate(
+        self,
+        input: bytes | str | None = None,
+        *,
+        check: bool = False,
+    ) -> CompletedProcess:
+        """:param input: Bytes or text to write before closing standard input.
+        :param check: Whether to raise on a non-zero return code.
+        :returns: Completed process details.
+        """
+        if input is not None:
+            await self.write_stdin(input)
+        await self.close_stdin()
+        return await self.wait(check=check)
+
+    async def _wait_native(self) -> CompletedProcess:
+        """:returns: Completed process details from the native handle."""
+        try:
+            native_result = await self._native_process.wait()
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+        return CompletedProcess(
+            args=tuple(native_result.args),
+            returncode=native_result.returncode,
+            stdout=native_result.stdout,
+            stderr=native_result.stderr,
+        )
+
+
 class VirtualProcessOutput:
     """A bounded output stream for a virtual executable invocation."""
 
@@ -759,8 +940,16 @@ class Sandbox:
         :param exc_value: Exception value raised in the context.
         :param traceback: Traceback raised in the context.
         """
-        self._shutdown_event_handlers()
-        self.close_virtual_executables()
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close event handlers and virtual executable dispatch tasks."""
+        tasks = self._async_tasks()
+        try:
+            self._shutdown_event_handlers()
+            self.close_virtual_executables()
+        finally:
+            await _drain_cancelled_tasks(tasks)
 
     def register_executable(
         self,
@@ -812,11 +1001,9 @@ class Sandbox:
         self._cancel_virtual_executable_requests()
         task = self._virtual_executable_dispatch_task
         self._virtual_executable_dispatch_task = None
-        if task is None:
+        if task is None or task.done():
             return
-        if task.done():
-            return
-        task.cancel()
+        _cancel_task(task)
 
     def _ensure_virtual_executable_dispatcher(self) -> None:
         """:raises RuntimeError: Raised when no asyncio loop is running."""
@@ -836,7 +1023,7 @@ class Sandbox:
         for task in tuple(self._virtual_executable_request_tasks.values()):
             if task.done():
                 continue
-            task.cancel()
+            _cancel_task(task)
 
     def _start_virtual_process_request(self, request_id: int, payload: bytes) -> None:
         """:param request_id: Native request identifier.
@@ -883,8 +1070,11 @@ class Sandbox:
             )
             if cancellation_task in done:
                 handler_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await handler_task
+                await _await_cancelled_handler(handler_task)
+                self._complete_virtual_process(
+                    request_id,
+                    _encode_virtual_executable_response(_virtual_handler_cancelled_result()),
+                )
                 return
 
             response = await handler_task
@@ -895,8 +1085,7 @@ class Sandbox:
         except asyncio.CancelledError:
             handler_task.cancel()
             cancellation_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await handler_task
+            await _await_cancelled_handler(handler_task)
             with contextlib.suppress(asyncio.CancelledError):
                 await cancellation_task
             self._complete_virtual_process(
@@ -997,11 +1186,9 @@ class Sandbox:
         self._event_dispatch_generation += 1
         task = self._event_dispatch_task
         self._event_dispatch_task = None
-        if task is None:
+        if task is None or task.done():
             return
-        if task.done():
-            return
-        task.cancel()
+        _cancel_task(task)
 
     def _remove_event_subscription(self, token: int) -> None:
         """:param token: Handler token to remove."""
@@ -1035,6 +1222,10 @@ class Sandbox:
                 for registration in tuple(self._event_handlers.values()):
                     if _event_matches(registration, event):
                         self._queue_event_delivery(registration, event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.error("sandbox event dispatcher failed\n%s", traceback.format_exc())
         finally:
             if self._event_dispatch_generation == generation:
                 self._native_sandbox.set_event_notifications_enabled(False)
@@ -1076,7 +1267,18 @@ class Sandbox:
         """:param registration: Handler registration to stop."""
         if registration.worker_task.done():
             return
-        registration.worker_task.cancel()
+        _cancel_task(registration.worker_task)
+
+    def _async_tasks(self) -> tuple[asyncio.Task[None], ...]:
+        """:returns: Async tasks owned by this sandbox."""
+        tasks: list[asyncio.Task[None]] = []
+        if self._event_dispatch_task is not None:
+            tasks.append(self._event_dispatch_task)
+        if self._virtual_executable_dispatch_task is not None:
+            tasks.append(self._virtual_executable_dispatch_task)
+        tasks.extend(registration.worker_task for registration in self._event_handlers.values())
+        tasks.extend(self._virtual_executable_request_tasks.values())
+        return tuple(tasks)
 
     def _queue_event_delivery(
         self,
@@ -1101,6 +1303,60 @@ class Sandbox:
         if _queue_event_nowait(registration, event):
             return
         registration.dropped_count += 1
+
+    def start(
+        self,
+        args: list[str] | tuple[str, ...],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+    ) -> SandboxProcess:
+        """:param args: Command and arguments.
+        :param env: Environment variable overrides.
+        :param cwd: Working directory override.
+        :returns: Running process handle.
+        """
+        self._ensure_virtual_executable_dispatcher()
+        process_token = self._next_process_token
+        self._next_process_token += 1
+        try:
+            native_process = self._native_sandbox.start(
+                process_token,
+                list(args),
+                env,
+                cwd,
+            )
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+        return SandboxProcess(native_process)
+
+    def spawn(
+        self,
+        args: list[str] | tuple[str, ...],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+    ) -> SandboxProcess:
+        """:param args: Command and arguments.
+        :param env: Environment variable overrides.
+        :param cwd: Working directory override.
+        :returns: Running process handle.
+        """
+        return self.start(args, env=env, cwd=cwd)
+
+    def popen(
+        self,
+        args: list[str] | tuple[str, ...],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+    ) -> SandboxProcess:
+        """:param args: Command and arguments.
+        :param env: Environment variable overrides.
+        :param cwd: Working directory override.
+        :returns: Running process handle.
+        """
+        return self.start(args, env=env, cwd=cwd)
 
     async def run(
         self,
@@ -1266,11 +1522,75 @@ async def _dispatch_virtual_processes(
             if sandbox is None:
                 return
             sandbox._start_virtual_process_request(request_id, payload)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOGGER.error(
+            "virtual executable dispatcher failed\n%s",
+            traceback.format_exc(),
+        )
     finally:
         sandbox = sandbox_reference()
         if sandbox is not None:
             sandbox._virtual_executable_dispatch_task = None
             sandbox._cancel_virtual_executable_requests()
+
+
+async def _await_cancelled_handler(task: asyncio.Task[bytes]) -> None:
+    """:param task: Handler task to wait after requesting cancellation."""
+    try:
+        await task
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        LOGGER.error(
+            "virtual executable handler cancellation failed\n%s",
+            traceback.format_exc(),
+        )
+
+
+def _cancel_task(task: asyncio.Task[object]) -> None:
+    """:param task: Task to cancel on its owning event loop."""
+    if task.done():
+        return
+    loop = task.get_loop()
+    if loop.is_closed():
+        return
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop.call_soon_threadsafe(task.cancel)
+        return
+    if running_loop is loop:
+        task.cancel()
+        return
+    loop.call_soon_threadsafe(task.cancel)
+
+
+async def _drain_cancelled_tasks(tasks: Iterable[asyncio.Task[object]]) -> None:
+    """:param tasks: Tasks that have been asked to shut down."""
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    current_task = asyncio.current_task()
+    local_tasks = [
+        task
+        for task in tasks
+        if not task.done() and task.get_loop() is running_loop and task is not current_task
+    ]
+    if len(local_tasks) == 0:
+        return
+    try:
+        results = await asyncio.gather(*local_tasks, return_exceptions=True)
+    except asyncio.CancelledError:
+        await asyncio.gather(*local_tasks, return_exceptions=True)
+        raise
+    for result in results:
+        if isinstance(result, asyncio.CancelledError):
+            continue
+        if isinstance(result, Exception):
+            LOGGER.error("sandbox task shutdown failed: %r", result)
 
 
 def _normalize_package_command_aliases(
