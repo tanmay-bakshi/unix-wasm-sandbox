@@ -26,6 +26,7 @@ use wasmer::sys::{BaseTunables, EngineBuilder, Features, NativeEngineExt, LLVM};
 use wasmer_package::utils::from_bytes;
 use wasmer_wasix::{
     bin_factory::{spawn_exec, BinaryPackage},
+    os::{TtyBridge, WasiTtyState},
     runtime::{
         module_cache::{FileSystemCache, ModuleCache, SharedCache},
         package_loader::BuiltinPackageLoader,
@@ -356,6 +357,26 @@ pub struct PackageCatalog {
     handle: tokio::runtime::Handle,
     packages: HashMap<String, Arc<BinaryPackage>>,
     command_paths: HashMap<PathBuf, CommandTarget>,
+}
+
+#[derive(Debug)]
+struct NonInteractiveTty;
+
+impl TtyBridge for NonInteractiveTty {
+    fn reset(&self) {}
+
+    fn tty_get(&self) -> WasiTtyState {
+        WasiTtyState {
+            stdin_tty: false,
+            stdout_tty: false,
+            stderr_tty: false,
+            echo: false,
+            line_buffered: false,
+            ..WasiTtyState::default()
+        }
+    }
+
+    fn tty_set(&self, _tty_state: WasiTtyState) {}
 }
 
 pub struct RunRequest {
@@ -1828,6 +1849,7 @@ impl PackageCatalog {
         let _runtime_guard = handle.enter();
         let mut runtime = PluggableRuntime::new(virtual_task_manager);
         runtime.set_engine(sandbox_engine());
+        runtime.set_tty(Arc::new(NonInteractiveTty));
         runtime.set_module_cache(SharedCache::default().with_fallback(FileSystemCache::new(
             module_cache_dir(),
             Arc::clone(&task_manager),

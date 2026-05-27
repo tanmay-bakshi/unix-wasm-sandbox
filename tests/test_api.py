@@ -88,6 +88,19 @@ async def test_python_process_runs_in_standard_image() -> None:
 
 
 @pytest.mark.asyncio
+async def test_python_stdin_heredoc_runs_non_interactively() -> None:
+    """Verify Python reads shell heredoc stdin as script input."""
+    sandbox = Sandbox()
+    result = await sandbox.run(
+        ["bash", "-lc", "python - << 'PY'\nprint('test')\nPY"],
+        check=True,
+        wall_time_seconds=120.0,
+    )
+    assert result.stdout_text == "test\n"
+    assert result.stderr_text == ""
+
+
+@pytest.mark.asyncio
 async def test_python_process_loads_wasix_shared_library() -> None:
     """Verify that bundled Python can load WASIX shared libraries."""
     sandbox = Sandbox()
@@ -941,7 +954,7 @@ async def test_sandbox_python_subprocess_can_spawn_virtual_executable() -> None:
             (
                 "import subprocess, sys\n"
                 "process = subprocess.run(['python-tool', 'child'], capture_output=True)\n"
-                "print(process.returncode)\n"
+                "print(process.returncode, flush=True)\n"
                 "sys.stdout.buffer.write(process.stdout)\n"
                 "sys.stderr.buffer.write(process.stderr)\n"
             ),
