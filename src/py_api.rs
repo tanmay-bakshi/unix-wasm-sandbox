@@ -180,8 +180,6 @@ impl Sandbox {
         packages: Vec<(String, String, String, Vec<(String, String)>)>,
         cwd: String,
         env: HashMap<String, String>,
-        output_limit: usize,
-        wall_time_seconds: Option<f64>,
         event_queue_size: usize,
     ) -> PyResult<Self> {
         let (events, event_receiver) = EventBus::new(event_queue_size);
@@ -215,10 +213,6 @@ impl Sandbox {
                         .collect(),
                     cwd,
                     env,
-                    Limits {
-                        output_bytes: output_limit,
-                        wall_time_seconds,
-                    },
                     events.clone(),
                     virtual_processes,
                 )
@@ -350,13 +344,10 @@ impl Sandbox {
         args: Vec<String>,
         env: Option<HashMap<String, String>>,
         cwd: Option<String>,
+        output_limit: usize,
+        wall_time_seconds: Option<f64>,
     ) -> PyResult<StartedProcess> {
         let state = self.state.clone();
-        let output_limit = state
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("sandbox state lock failed"))?
-            .limits
-            .output_bytes;
         let stdin = InteractiveStdin::new();
         let stdout = CapturedOutput::new(output_limit);
         let stderr = CapturedOutput::new(output_limit);
@@ -369,6 +360,10 @@ impl Sandbox {
             input: None,
             env,
             cwd,
+            limits: Limits {
+                output_bytes: output_limit,
+                wall_time_seconds,
+            },
         };
         let stdin_for_task = stdin.clone();
         let streams = ProcessStreams {
@@ -466,6 +461,8 @@ impl Sandbox {
         input: Option<Vec<u8>>,
         env: Option<HashMap<String, String>>,
         cwd: Option<String>,
+        output_limit: usize,
+        wall_time_seconds: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = self.state.clone();
         let cancellation_source = CancellationSource::new();
@@ -485,6 +482,10 @@ impl Sandbox {
                         input,
                         env,
                         cwd,
+                        limits: Limits {
+                            output_bytes: output_limit,
+                            wall_time_seconds,
+                        },
                     },
                     cancellation,
                 )

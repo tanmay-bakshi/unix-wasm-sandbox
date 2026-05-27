@@ -35,8 +35,6 @@ class Sandbox:
         packages: list[tuple[str, str, str, list[tuple[str, str]]]],
         cwd: str,
         env: dict[str, str],
-        output_limit: int,
-        wall_time_seconds: float | None,
         event_queue_size: int,
     ) -> None: ...
 
@@ -71,6 +69,8 @@ class Sandbox:
         args: list[str],
         env: dict[str, str] | None,
         cwd: str | None,
+        output_limit: int,
+        wall_time_seconds: float | None,
     ) -> StartedProcess: ...
 
     def exists(self, path: str) -> Awaitable[bool]: ...
@@ -88,4 +88,6 @@ class Sandbox:
         input: bytes | None,
         env: dict[str, str] | None,
         cwd: str | None,
+        output_limit: int,
+        wall_time_seconds: float | None,
     ) -> Awaitable[CompletedProcess]: ...

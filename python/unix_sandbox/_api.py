@@ -21,7 +21,7 @@ from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path
 from types import TracebackType
-from typing import Self
+from typing import Self, cast
 
 from . import _native
 
@@ -38,6 +38,14 @@ STANDARD_PACKAGE_NAMES = (
     "gzip",
     "python",
 )
+
+
+class _WallTimeSecondsUnset:
+    """Sentinel for omitted per-process wall-time overrides."""
+
+
+_WALL_TIME_SECONDS_UNSET = _WallTimeSecondsUnset()
+_DEFAULT_WALL_TIME_SECONDS_ARG = cast(float | None, _WALL_TIME_SECONDS_UNSET)
 
 
 class SandboxError(RuntimeError):
@@ -713,12 +721,16 @@ class CommandInvocation:
         input: bytes | str | None = None,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        limits: "Limits | None" = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
         check: bool = False,
     ) -> CompletedProcess:
         """:param args: Command and arguments.
         :param input: Bytes or text to pass as stdin.
         :param env: Environment variable overrides.
         :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
         :param check: Whether to raise on a non-zero return code.
         :returns: Completed process details.
         """
@@ -727,6 +739,8 @@ class CommandInvocation:
             input=input,
             env=env,
             cwd=self.cwd if cwd is None else cwd,
+            limits=limits,
+            wall_time_seconds=wall_time_seconds,
             check=check,
         )
 
@@ -831,6 +845,29 @@ class Limits:
         raise ValueError("wall_time_seconds must be a positive finite number")
 
 
+def _resolve_process_limits(
+    default_limits: Limits,
+    limits: Limits | None,
+    wall_time_seconds: float | None | _WallTimeSecondsUnset,
+) -> Limits:
+    """:param default_limits: Sandbox-level process limits.
+    :param limits: Complete per-process limit override.
+    :param wall_time_seconds: Per-process wall-time override.
+    :returns: Limits to apply to a single process.
+    :raises ValueError: Raised when both override forms are supplied.
+    """
+    if limits is not None and not isinstance(wall_time_seconds, _WallTimeSecondsUnset):
+        raise ValueError("limits and wall_time_seconds cannot both be set")
+    if limits is not None:
+        return limits
+    if isinstance(wall_time_seconds, _WallTimeSecondsUnset):
+        return default_limits
+    return Limits(
+        output_bytes=default_limits.output_bytes,
+        wall_time_seconds=wall_time_seconds,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxConfig:
     """Configuration for a sandbox instance.
@@ -903,8 +940,6 @@ class Sandbox:
                 packages,
                 self._config.cwd,
                 self._config.env,
-                self._config.limits.output_bytes,
-                self._config.limits.wall_time_seconds,
                 self._config.event_queue_size,
             )
         except RuntimeError as error:
@@ -1310,12 +1345,21 @@ class Sandbox:
         *,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
     ) -> SandboxProcess:
         """:param args: Command and arguments.
         :param env: Environment variable overrides.
         :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
         :returns: Running process handle.
         """
+        process_limits = _resolve_process_limits(
+            self._config.limits,
+            limits,
+            wall_time_seconds,
+        )
         self._ensure_virtual_executable_dispatcher()
         process_token = self._next_process_token
         self._next_process_token += 1
@@ -1325,6 +1369,8 @@ class Sandbox:
                 list(args),
                 env,
                 cwd,
+                process_limits.output_bytes,
+                process_limits.wall_time_seconds,
             )
         except RuntimeError as error:
             raise SandboxError(str(error)) from error
@@ -1336,13 +1382,23 @@ class Sandbox:
         *,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
     ) -> SandboxProcess:
         """:param args: Command and arguments.
         :param env: Environment variable overrides.
         :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
         :returns: Running process handle.
         """
-        return self.start(args, env=env, cwd=cwd)
+        return self.start(
+            args,
+            env=env,
+            cwd=cwd,
+            limits=limits,
+            wall_time_seconds=wall_time_seconds,
+        )
 
     def popen(
         self,
@@ -1350,13 +1406,23 @@ class Sandbox:
         *,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
     ) -> SandboxProcess:
         """:param args: Command and arguments.
         :param env: Environment variable overrides.
         :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
         :returns: Running process handle.
         """
-        return self.start(args, env=env, cwd=cwd)
+        return self.start(
+            args,
+            env=env,
+            cwd=cwd,
+            limits=limits,
+            wall_time_seconds=wall_time_seconds,
+        )
 
     async def run(
         self,
@@ -1365,17 +1431,26 @@ class Sandbox:
         input: bytes | str | None = None,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
         check: bool = False,
     ) -> CompletedProcess:
         """:param args: Command and arguments.
         :param input: Bytes or text to pass as stdin.
         :param env: Environment variable overrides.
         :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
         :param check: Whether to raise on a non-zero return code.
         :returns: Completed process details.
         :raises SandboxError: Raised when check is true and the command fails.
         """
         input_bytes = input.encode() if isinstance(input, str) else input
+        process_limits = _resolve_process_limits(
+            self._config.limits,
+            limits,
+            wall_time_seconds,
+        )
         self._ensure_virtual_executable_dispatcher()
         process_token = self._next_process_token
         self._next_process_token += 1
@@ -1386,6 +1461,8 @@ class Sandbox:
                 input_bytes,
                 env,
                 cwd,
+                process_limits.output_bytes,
+                process_limits.wall_time_seconds,
             )
         )
         try:
@@ -1428,15 +1505,27 @@ class Sandbox:
         input: bytes | str | None = None,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
     ) -> bytes:
         """:param args: Command and arguments.
         :param input: Bytes or text to pass as stdin.
         :param env: Environment variable overrides.
         :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
         :returns: Captured stdout bytes.
         :raises SandboxError: Raised when the command fails.
         """
-        result = await self.run(args, input=input, env=env, cwd=cwd, check=True)
+        result = await self.run(
+            args,
+            input=input,
+            env=env,
+            cwd=cwd,
+            limits=limits,
+            wall_time_seconds=wall_time_seconds,
+            check=True,
+        )
         return result.stdout
 
     async def check_output_text(
@@ -1446,17 +1535,28 @@ class Sandbox:
         input: bytes | str | None = None,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
         encoding: str = "utf-8",
     ) -> str:
         """:param args: Command and arguments.
         :param input: Bytes or text to pass as stdin.
         :param env: Environment variable overrides.
         :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
         :param encoding: Encoding to use.
         :returns: Captured stdout text.
         :raises SandboxError: Raised when the command fails.
         """
-        data = await self.check_output(args, input=input, env=env, cwd=cwd)
+        data = await self.check_output(
+            args,
+            input=input,
+            env=env,
+            cwd=cwd,
+            limits=limits,
+            wall_time_seconds=wall_time_seconds,
+        )
         return data.decode(encoding)
 
     async def read_text(self, path: str, encoding: str = "utf-8") -> str:

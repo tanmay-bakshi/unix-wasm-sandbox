@@ -489,11 +489,82 @@ async def test_wall_time_limit_raises_sandbox_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_accepts_wall_time_override() -> None:
+    """Verify that one-shot commands can override the sandbox wall-time limit."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=None)))
+    with pytest.raises(SandboxError, match="wall time limit"):
+        await sandbox.run(
+            ["python", "-c", "import time; time.sleep(1)"],
+            wall_time_seconds=0.05,
+        )
+
+
+@pytest.mark.asyncio
+async def test_process_limits_can_disable_default_wall_time() -> None:
+    """Verify that per-process limits can disable a sandbox-level timeout."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=0.05)))
+    result = await sandbox.run(
+        ["python", "-c", "import time; time.sleep(0.15); print('ok')"],
+        limits=Limits(wall_time_seconds=None),
+        check=True,
+    )
+    assert result.stdout_text == "ok\n"
+
+
+@pytest.mark.asyncio
+async def test_wall_time_shortcut_can_disable_default_wall_time() -> None:
+    """Verify that an explicit None wall-time override disables the default timeout."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=0.05)))
+    result = await sandbox.run(
+        ["python", "-c", "import time; time.sleep(0.15); print('ok')"],
+        wall_time_seconds=None,
+        check=True,
+    )
+    assert result.stdout_text == "ok\n"
+
+
+@pytest.mark.asyncio
+async def test_started_process_accepts_limit_override() -> None:
+    """Verify that started processes use per-process timeout limits."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=None)))
+    process = sandbox.start(
+        ["python", "-c", "import time; time.sleep(1)"],
+        wall_time_seconds=0.05,
+    )
+    try:
+        with pytest.raises(SandboxError, match="wall time limit"):
+            await process.wait()
+    finally:
+        await close_started_process(process)
+
+
+@pytest.mark.asyncio
+async def test_process_limit_override_rejects_ambiguous_timeout_forms() -> None:
+    """Verify that the timeout shortcut cannot be mixed with complete limits."""
+    sandbox = Sandbox()
+    with pytest.raises(ValueError, match="limits and wall_time_seconds"):
+        await sandbox.run(["true"], limits=Limits(), wall_time_seconds=1.0)
+    with pytest.raises(ValueError, match="limits and wall_time_seconds"):
+        sandbox.start(["true"], limits=Limits(), wall_time_seconds=None)
+
+
+@pytest.mark.asyncio
 async def test_output_limit_raises_sandbox_error() -> None:
     """Verify that oversized captured output raises a sandbox error."""
     sandbox = Sandbox(SandboxConfig(limits=Limits(output_bytes=4)))
     with pytest.raises(SandboxError, match="output exceeded"):
         await sandbox.run(["python", "-c", "print('too long')"])
+
+
+@pytest.mark.asyncio
+async def test_run_accepts_output_limit_override() -> None:
+    """Verify that one-shot commands can override the sandbox output limit."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(output_bytes=1024, wall_time_seconds=None)))
+    with pytest.raises(SandboxError, match="output exceeded"):
+        await sandbox.run(
+            ["python", "-c", "print('too long')"],
+            limits=Limits(output_bytes=4, wall_time_seconds=None),
+        )
 
 
 @pytest.mark.asyncio

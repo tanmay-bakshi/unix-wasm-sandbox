@@ -137,6 +137,24 @@ result = await sandbox.run(
 )
 ```
 
+Sandbox-level limits are defaults. A single command can override them with a
+complete `Limits` value, or can use `wall_time_seconds` as a timeout shortcut
+that preserves the configured output limit:
+
+```python
+short = await sandbox.run(["python", "/work/quick.py"], wall_time_seconds=2.0)
+
+unbounded_time = await sandbox.run(["python", "/work/long_job.py"], wall_time_seconds=None)
+
+unlimited = await sandbox.run(
+    ["python", "/work/long_job.py"],
+    limits=Limits(output_bytes=4 * 1024 * 1024, wall_time_seconds=None),
+)
+```
+
+The same process limit arguments are accepted by `start()`, `spawn()`,
+`popen()`, `check_output()`, and `check_output_text()`.
+
 Captured stdout and stderr are capped while the process writes, so a process
 cannot fill host memory before `Limits.output_bytes` is enforced.
 

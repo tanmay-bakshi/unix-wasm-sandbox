@@ -263,7 +263,6 @@ pub struct SandboxState {
     pub fs: TmpFileSystem,
     pub cwd: String,
     pub env: HashMap<String, String>,
-    pub limits: Limits,
     pub catalog: Arc<PackageCatalog>,
     pub events: EventBus,
     pub virtual_executables: VirtualExecutableRegistry,
@@ -364,6 +363,7 @@ pub struct RunRequest {
     pub input: Option<Vec<u8>>,
     pub env: Option<HashMap<String, String>>,
     pub cwd: Option<String>,
+    pub limits: Limits,
 }
 
 pub(crate) struct ProcessStreams {
@@ -1637,7 +1637,6 @@ impl SandboxState {
         packages: Vec<PackageSpec>,
         cwd: String,
         env: HashMap<String, String>,
-        limits: Limits,
         events: EventBus,
         virtual_processes: VirtualExecutableBridge,
     ) -> Result<Self> {
@@ -1656,7 +1655,6 @@ impl SandboxState {
             fs,
             cwd,
             env: sandbox_env,
-            limits,
             catalog,
             events,
             virtual_executables: VirtualExecutableRegistry::new(virtual_processes),
@@ -1878,18 +1876,20 @@ impl PackageCatalog {
             input,
             env,
             cwd,
+            limits,
         } = request;
         let input = input.unwrap_or_default();
         let streams = ProcessStreams {
             stdin: Box::new(StaticFile::new(input)),
-            stdout: CapturedOutput::new(state.limits.output_bytes),
-            stderr: CapturedOutput::new(state.limits.output_bytes),
+            stdout: CapturedOutput::new(limits.output_bytes),
+            stderr: CapturedOutput::new(limits.output_bytes),
         };
         let request = RunRequest {
             args,
             input: None,
             env,
             cwd,
+            limits,
         };
         self.run_with_stdio(state, request, streams, cancellation)
     }
@@ -1914,7 +1914,7 @@ impl PackageCatalog {
         let cwd = request.cwd.unwrap_or_else(|| state.cwd.clone());
         let cwd = normalize_path(&cwd)?;
         validate_directory(&state.fs, &cwd, "cwd")?;
-        let wall_time = match state.limits.wall_time_seconds {
+        let wall_time = match request.limits.wall_time_seconds {
             Some(seconds) => Some(duration_from_seconds(seconds)?),
             None => None,
         };
