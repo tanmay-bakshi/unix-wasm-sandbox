@@ -1,5 +1,7 @@
 """Typed Python facade for the Rust sandbox runtime."""
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import contextlib
@@ -16,12 +18,12 @@ import urllib.request
 import weakref
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 from importlib import resources
-from importlib.resources.abc import Traversable
+from importlib.abc import Traversable
 from pathlib import Path
 from types import TracebackType
-from typing import Self, cast
+from typing import TYPE_CHECKING, cast
 
 from . import _native
 
@@ -45,14 +47,14 @@ class _WallTimeSecondsUnset:
 
 
 _WALL_TIME_SECONDS_UNSET = _WallTimeSecondsUnset()
-_DEFAULT_WALL_TIME_SECONDS_ARG = cast(float | None, _WALL_TIME_SECONDS_UNSET)
+_DEFAULT_WALL_TIME_SECONDS_ARG = cast("float | None", _WALL_TIME_SECONDS_UNSET)
 
 
 class SandboxError(RuntimeError):
     """Error raised when a sandbox operation cannot be completed."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class File:
     """A file to place in the sandbox filesystem.
 
@@ -62,7 +64,7 @@ class File:
     data: bytes
 
     @classmethod
-    def text(cls, text: str, encoding: str = "utf-8") -> Self:
+    def text(cls, text: str, encoding: str = "utf-8") -> File:
         """:param text: Text to encode into the file.
         :param encoding: Encoding to use.
         :returns: File instance containing encoded text.
@@ -70,19 +72,19 @@ class File:
         return cls(text.encode(encoding))
 
     @classmethod
-    def bytes(cls, data: bytes) -> Self:
+    def bytes(cls, data: bytes) -> File:
         """:param data: File bytes.
         :returns: File instance containing the supplied bytes.
         """
         return cls(data)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Directory:
     """A directory to create in the sandbox filesystem."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class HostMount:
     """A live host directory mount inside the sandbox filesystem.
 
@@ -109,7 +111,15 @@ class HostMount:
         return (str(Path(self.source).expanduser()), self.target, self.read_only)
 
 
-class PackageSource(StrEnum):
+class _StringEnum(str, Enum):
+    """String-valued enum with ``StrEnum``-style string conversion."""
+
+    def __str__(self) -> str:
+        """:returns: The enum value."""
+        return cast(str, self.value)
+
+
+class PackageSource(_StringEnum):
     """Sources from which a Wasmer package can be loaded."""
 
     BUNDLED = "bundled"
@@ -117,7 +127,7 @@ class PackageSource(StrEnum):
     URL = "url"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class PackageCommandAlias:
     """An additional command name exposed for a package command.
 
@@ -134,10 +144,13 @@ class PackageCommandAlias:
         _validate_package_command_name(self.command, "command")
 
 
-PackageCommandAliasInput = PackageCommandAlias | tuple[str, str]
+if TYPE_CHECKING:
+    PackageCommandAliasInput = PackageCommandAlias | tuple[str, str]
+else:
+    PackageCommandAliasInput = object
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class WasmerPackage:
     """A Wasmer WEBC package available inside a sandbox image.
 
@@ -199,7 +212,7 @@ class WasmerPackage:
         name: str,
         *,
         command_aliases: Iterable[PackageCommandAliasInput] = (),
-    ) -> Self:
+    ) -> WasmerPackage:
         """:param name: Bundled package name.
         :param command_aliases: Additional command aliases exposed on PATH.
         :returns: Package loaded from the package's bundled assets.
@@ -218,7 +231,7 @@ class WasmerPackage:
         *,
         sha256: str | None = None,
         command_aliases: Iterable[PackageCommandAliasInput] = (),
-    ) -> Self:
+    ) -> WasmerPackage:
         """:param name: Logical package name.
         :param path: Local WEBC path.
         :param sha256: Expected WEBC SHA-256 digest.
@@ -241,7 +254,7 @@ class WasmerPackage:
         *,
         sha256: str,
         command_aliases: Iterable[PackageCommandAliasInput] = (),
-    ) -> Self:
+    ) -> WasmerPackage:
         """:param name: Logical package name.
         :param url: URL for a WEBC package.
         :param sha256: Expected WEBC SHA-256 digest.
@@ -257,7 +270,7 @@ class WasmerPackage:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SandboxImage:
     """Composable package image used to create sandbox process environments.
 
@@ -277,7 +290,7 @@ class SandboxImage:
         object.__setattr__(self, "packages", packages)
 
     @classmethod
-    def standard(cls) -> Self:
+    def standard(cls) -> SandboxImage:
         """:returns: Standard UNIX-like image bundled with this package."""
         return cls(
             tuple(
@@ -294,24 +307,24 @@ class SandboxImage:
         )
 
     @classmethod
-    def empty(cls) -> Self:
+    def empty(cls) -> SandboxImage:
         """:returns: Empty image with no Wasmer packages."""
         return cls()
 
     @classmethod
-    def from_packages(cls, packages: Iterable[WasmerPackage]) -> Self:
+    def from_packages(cls, packages: Iterable[WasmerPackage]) -> SandboxImage:
         """:param packages: Packages to include.
         :returns: Image containing the supplied packages.
         """
         return cls(tuple(packages))
 
-    def with_packages(self, *packages: WasmerPackage) -> Self:
+    def with_packages(self, *packages: WasmerPackage) -> SandboxImage:
         """:param packages: Packages to append to the image.
         :returns: Image with the supplied packages appended.
         """
         return type(self)((*self.packages, *packages))
 
-    def without(self, *names: str) -> Self:
+    def without(self, *names: str) -> SandboxImage:
         """:param names: Package names to remove.
         :returns: Image without packages matching the supplied names.
         """
@@ -321,7 +334,7 @@ class SandboxImage:
         )
 
 
-class SandboxEventKind(StrEnum):
+class SandboxEventKind(_StringEnum):
     """Filesystem event kinds emitted by a sandbox."""
 
     FILE_CREATED = "file_created"
@@ -334,7 +347,7 @@ class SandboxEventKind(StrEnum):
     EVENTS_DROPPED = "events_dropped"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SandboxEvent:
     """A filesystem event emitted by a sandbox.
 
@@ -352,7 +365,7 @@ class SandboxEvent:
     dropped_count: int = 0
 
     @classmethod
-    def _from_native(cls, event: tuple[int, str, str, str | None, int]) -> Self:
+    def _from_native(cls, event: tuple[int, str, str, str | None, int]) -> SandboxEvent:
         """:param event: Native event tuple.
         :returns: Python event object.
         """
@@ -366,10 +379,13 @@ class SandboxEvent:
         )
 
 
-FilesystemEventHandler = Callable[[SandboxEvent], Awaitable[None] | None]
+if TYPE_CHECKING:
+    FilesystemEventHandler = Callable[[SandboxEvent], Awaitable[None] | None]
+else:
+    FilesystemEventHandler = Callable[[SandboxEvent], object]
 
 
-@dataclass(slots=True)
+@dataclass
 class _EventHandlerRegistration:
     """A registered event handler and its delivery filter.
 
@@ -392,11 +408,11 @@ class _EventHandlerRegistration:
 class EventSubscription:
     """A handle for removing a sandbox event handler."""
 
-    _sandbox: "Sandbox"
+    _sandbox: Sandbox
     _token: int
     _closed: bool
 
-    def __init__(self, sandbox: "Sandbox", token: int) -> None:
+    def __init__(self, sandbox: Sandbox, token: int) -> None:
         """:param sandbox: Sandbox that owns the handler.
         :param token: Handler token to remove.
         """
@@ -421,7 +437,7 @@ class EventSubscription:
         self.close()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class CompletedProcess:
     """A finished sandbox process.
 
@@ -478,7 +494,7 @@ class SandboxProcess:
         except Exception:
             LOGGER.debug("sandbox process destructor cleanup failed\n%s", traceback.format_exc())
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> SandboxProcess:
         """:returns: This running process."""
         return self
 
@@ -672,7 +688,7 @@ class VirtualProcessOutput:
         return b"".join(self._chunks)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class CommandResult:
     """A result returned by a virtual executable handler.
 
@@ -686,7 +702,7 @@ class CommandResult:
     stderr: bytes = b""
 
 
-@dataclass(slots=True)
+@dataclass
 class CommandInvocation:
     """A virtual executable invocation.
 
@@ -700,7 +716,7 @@ class CommandInvocation:
     :ivar stderr: Standard error stream.
     """
 
-    sandbox: "Sandbox"
+    sandbox: Sandbox
     executable_path: str
     argv: tuple[str, ...]
     cwd: str
@@ -721,7 +737,7 @@ class CommandInvocation:
         input: bytes | str | None = None,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
-        limits: "Limits | None" = None,
+        limits: Limits | None = None,
         wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
         check: bool = False,
     ) -> CompletedProcess:
@@ -764,14 +780,18 @@ class CommandInvocation:
         await self.sandbox.write_text(path, text, encoding)
 
 
-VirtualExecutableResult = int | CommandResult | CompletedProcess | None
-VirtualExecutableHandler = Callable[
-    [CommandInvocation],
-    Awaitable[VirtualExecutableResult] | VirtualExecutableResult,
-]
+if TYPE_CHECKING:
+    VirtualExecutableResult = int | CommandResult | CompletedProcess | None
+    VirtualExecutableHandler = Callable[
+        [CommandInvocation],
+        Awaitable[VirtualExecutableResult] | VirtualExecutableResult,
+    ]
+else:
+    VirtualExecutableResult = object
+    VirtualExecutableHandler = Callable[[CommandInvocation], object]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class VirtualExecutable:
     """A host-backed executable exposed inside the sandbox.
 
@@ -794,11 +814,11 @@ class VirtualExecutable:
 class VirtualExecutableRegistration:
     """A handle for removing a virtual executable."""
 
-    _sandbox: "Sandbox"
+    _sandbox: Sandbox
     _token: int
     _closed: bool
 
-    def __init__(self, sandbox: "Sandbox", token: int) -> None:
+    def __init__(self, sandbox: Sandbox, token: int) -> None:
         """:param sandbox: Sandbox that owns the virtual executable.
         :param token: Handler token to remove.
         """
@@ -823,7 +843,7 @@ class VirtualExecutableRegistration:
         self.close()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Limits:
     """Resource limits applied to sandbox process execution.
 
@@ -868,7 +888,7 @@ def _resolve_process_limits(
     )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SandboxConfig:
     """Configuration for a sandbox instance.
 
@@ -961,7 +981,7 @@ class Sandbox:
         except Exception:
             LOGGER.debug("sandbox destructor cleanup failed\n%s", traceback.format_exc())
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> Sandbox:
         """:returns: This sandbox."""
         return self
 
